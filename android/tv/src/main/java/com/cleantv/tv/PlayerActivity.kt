@@ -220,7 +220,18 @@ class PlayerActivity : AppCompatActivity(), CastController {
 
     private fun setVolume(level: Int) {
         val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-        audio.setStreamVolume(AudioManager.STREAM_MUSIC, level.coerceIn(0, max), AudioManager.FLAG_SHOW_UI)
+        val target = level.coerceIn(0, max)
+        audio.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+        // Fire OS ignores setStreamVolume from apps; step towards the target instead.
+        var guard = max + 2
+        while (guard-- > 0) {
+            val cur = audio.getStreamVolume(AudioManager.STREAM_MUSIC)
+            if (cur == target) break
+            val dir = if (cur < target) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER
+            audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, dir, 0)
+            if (audio.getStreamVolume(AudioManager.STREAM_MUSIC) == cur) break
+        }
+        audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_SAME, AudioManager.FLAG_SHOW_UI)
     }
 
     private fun setSpeed(speed: Float) {
@@ -326,7 +337,9 @@ class PlayerActivity : AppCompatActivity(), CastController {
             choose("Screen size", ASPECTS.map { it.second }, aspect) { setAspect(it) }
         }
         entries += "Volume:  $vol / $volMax" to {
-            choose("Volume", (0..volMax).map { if (it == 0) "Mute" else "$it" }, vol) { setVolume(it) }
+            val step = if (volMax > 30) 5 else 1
+            val levels = (0..volMax step step).toList()
+            choose("Volume", levels.map { if (it == 0) "Mute" else "$it" }, levels.indexOfFirst { it >= vol }) { setVolume(levels[it]) }
         }
         entries += "Speed:  ${p.playbackParameters.speed}x" to {
             choose("Speed", SPEEDS.map { "${it}x" }, SPEEDS.indexOf(p.playbackParameters.speed)) { setSpeed(SPEEDS[it]) }

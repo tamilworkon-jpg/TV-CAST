@@ -11,8 +11,8 @@ android {
         applicationId = "com.cleantv.tv"
         minSdk = 22
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 4
+        versionName = "1.3"
     }
 
     signingConfigs {
