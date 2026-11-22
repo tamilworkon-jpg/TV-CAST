@@ -1,0 +1,21 @@
+# Build output
+android/.gradle/
+android/**/build/
+android/local.properties
+out/
+
+# Signing key (generated locally by build.ps1)
+android/keystore/
+*.keystore
+*.jks
+
+# Local tools, test files and unrelated downloads
+tools/
+downloads/
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db

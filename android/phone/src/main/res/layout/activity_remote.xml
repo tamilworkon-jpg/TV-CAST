@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fitsSystemWindows="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="20dp">
+
+        <TextView
+            android:id="@+id/tvName"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:drawableStart="@drawable/dot_on"
+            android:drawablePadding="8dp"
+            android:gravity="center_vertical"
+            android:textColor="@color/text2"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:maxLines="3"
+            android:ellipsize="end"
+            android:textColor="@color/text"
+            android:textSize="22sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/state"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:textColor="@color/accent"
+            android:text="Connecting…" />
+
+        <LinearLayout
+            android:id="@+id/videoPanel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <SeekBar
+                android:id="@+id/seek"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+
+            <TextView
+                android:id="@+id/time"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:paddingEnd="16dp"
+                android:textColor="@color/text2" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:gravity="center"
+                android:orientation="horizontal">
+
+                <Button android:id="@+id/btnRew60" style="@style/Widget.Material3.Button.TextButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:text="-1m" android:textColor="@color/text2" />
+                <Button android:id="@+id/btnRew" style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="0dp" android:layout_height="56dp" android:layout_weight="1"
+                    android:layout_margin="4dp" android:text="-10s" />
+                <com.google.android.material.button.MaterialButton android:id="@+id/btnPlay"
+                    android:layout_width="76dp" android:layout_height="76dp"
+                    android:layout_margin="6dp" android:insetTop="0dp" android:insetBottom="0dp"
+                    android:padding="0dp"
+                    app:cornerRadius="38dp" app:icon="@android:drawable/ic_media_pause"
+                    app:iconGravity="textStart" app:iconPadding="0dp" app:iconSize="36dp" />
+                <Button android:id="@+id/btnFwd" style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="0dp" android:layout_height="56dp" android:layout_weight="1"
+                    android:layout_margin="4dp" android:text="+10s" />
+                <Button android:id="@+id/btnFwd60" style="@style/Widget.Material3.Button.TextButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:text="+1m" android:textColor="@color/text2" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <Button android:id="@+id/btnAudio" style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:layout_margin="3dp" android:text="Audio" />
+                <Button android:id="@+id/btnSubs" style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:layout_margin="3dp" android:text="Subtitles" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button android:id="@+id/btnSpeed" style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:layout_margin="3dp" android:text="Speed 1.0x" />
+                <Button android:id="@+id/btnAspect" style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:layout_margin="3dp" android:text="Screen: Fit" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/btnExternal"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_margin="3dp"
+                android:text="Play in another TV player (VLC / MX)" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/imagePanel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <Button android:id="@+id/btnPrev" style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                android:layout_margin="3dp" android:text="◀ Prev" />
+            <Button android:id="@+id/btnSlide"
+                android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1.3"
+                android:layout_margin="3dp" android:text="Slideshow" />
+            <Button android:id="@+id/btnNext" style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                android:layout_margin="3dp" android:text="Next ▶" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="28dp"
+            android:textColor="@color/text2"
+            android:text="TV volume" />
+
+        <SeekBar
+            android:id="@+id/volSeek"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:max="15" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:orientation="horizontal">
+
+            <Button android:id="@+id/btnVolDown" style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                android:layout_margin="3dp" android:text="Vol −" />
+            <Button android:id="@+id/btnMute" style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                android:layout_margin="3dp" android:text="Mute" />
+            <Button android:id="@+id/btnVolUp" style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                android:layout_margin="3dp" android:text="Vol +" />
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/btnStop"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="28dp"
+            android:textColor="#FF6B6B"
+            android:text="Stop on TV" />
+    </LinearLayout>
+</ScrollView>
