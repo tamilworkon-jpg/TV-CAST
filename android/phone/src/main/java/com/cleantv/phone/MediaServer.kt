@@ -25,6 +25,7 @@ class MediaServer(private val ctx: Context, private val token: String) : NanoHTT
             val id = parts.getOrNull(1)?.substringBefore('.')?.toLongOrNull()
             when (parts.getOrNull(0)) {
                 "list" -> newFixedLengthResponse(Response.Status.OK, "application/json", MediaRepo.libraryJson(ctx))
+                "alive" -> newFixedLengthResponse("ok")
                 "t" -> serveThumb(parts.getOrNull(1), parts.getOrNull(2)?.toLongOrNull())
                 "v" -> if (id == null) notFound() else serveUri(session, MediaRepo.videoUri(id))
                 "i" -> if (id == null) notFound() else serveUri(session, MediaRepo.imageUri(id))

@@ -143,6 +143,67 @@
                 android:layout_margin="3dp" android:text="Next ▶" />
         </LinearLayout>
 
+        <!-- Rotate / zoom: shared by videos and pictures -->
+        <LinearLayout
+            android:id="@+id/viewPanel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/viewState"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingStart="4dp"
+                android:textColor="@color/text2"
+                android:text="Rotate &amp; zoom" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button android:id="@+id/btnRotL" style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:layout_margin="3dp" android:text="⟲ 90°" />
+                <Button android:id="@+id/btnRotR" style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:layout_margin="3dp" android:text="⟳ 90°" />
+                <Button android:id="@+id/btnZoomOut" style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:layout_margin="3dp" android:text="Zoom −" />
+                <Button android:id="@+id/btnZoomIn" style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:layout_margin="3dp" android:text="Zoom +" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/panRow"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button android:id="@+id/btnPanL" style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:layout_margin="3dp" android:text="◀" />
+                <Button android:id="@+id/btnPanU" style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:layout_margin="3dp" android:text="▲" />
+                <Button android:id="@+id/btnPanD" style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:layout_margin="3dp" android:text="▼" />
+                <Button android:id="@+id/btnPanR" style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:layout_margin="3dp" android:text="▶" />
+            </LinearLayout>
+
+            <Button android:id="@+id/btnResetView" style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:text="Reset rotation &amp; zoom" />
+        </LinearLayout>
+
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

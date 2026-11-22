@@ -168,7 +168,10 @@ class MainActivity : AppCompatActivity() {
         .all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
 
     private fun maybeAskAllFilesAccess() {
-        if (Environment.isExternalStorageManager() || Prefs.getFlag(this, "asked_all_files")) return
+        if (Environment.isExternalStorageManager() || Prefs.getFlag(this, "asked_all_files")) {
+            maybeAskBattery()
+            return
+        }
         Prefs.setFlag(this, "asked_all_files")
         AlertDialog.Builder(this)
             .setTitle("Subtitles")
@@ -177,6 +180,30 @@ class MainActivity : AppCompatActivity() {
                 startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
             }
             .setNegativeButton("Skip", null)
+            .show()
+    }
+
+    /**
+     * vivo/Funtouch kills background apps on a locked phone, which would stop the TV mid-movie.
+     * Ask once to exempt TV Cast from battery optimisation.
+     */
+    @android.annotation.SuppressLint("BatteryLife")
+    private fun maybeAskBattery() {
+        val pm = getSystemService(android.os.PowerManager::class.java)
+        if (pm.isIgnoringBatteryOptimizations(packageName) || Prefs.getFlag(this, "asked_battery")) return
+        Prefs.setFlag(this, "asked_battery")
+        AlertDialog.Builder(this)
+            .setTitle("Keep playing when the phone is locked")
+            .setMessage(
+                "So the TV doesn't stop when your phone screen turns off, allow TV Cast to run without battery restrictions.\n\n" +
+                    "On vivo also check: Settings → Battery → Background power consumption → TV Cast → Allow."
+            )
+            .setPositiveButton("Allow") { _, _ ->
+                runCatching {
+                    startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                }
+            }
+            .setNegativeButton("Later", null)
             .show()
     }
 

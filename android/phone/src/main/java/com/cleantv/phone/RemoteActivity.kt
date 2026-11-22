@@ -32,6 +32,9 @@ class RemoteActivity : AppCompatActivity() {
     private lateinit var btnAspect: Button
     private lateinit var btnSlide: Button
     private var dragging = false
+    private lateinit var viewPanel: View
+    private lateinit var panRow: View
+    private lateinit var viewState: TextView
     private var volDragging = false
     private lateinit var volSeek: SeekBar
     private var failures = 0
@@ -81,6 +84,18 @@ class RemoteActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnPrev).setOnClickListener { send("prev") }
         findViewById<Button>(R.id.btnNext).setOnClickListener { send("next") }
         btnSlide.setOnClickListener { send("slideshow") }
+        viewPanel = findViewById(R.id.viewPanel)
+        panRow = findViewById(R.id.panRow)
+        viewState = findViewById(R.id.viewState)
+        findViewById<Button>(R.id.btnRotL).setOnClickListener { send("rotate", "-90") }
+        findViewById<Button>(R.id.btnRotR).setOnClickListener { send("rotate", "90") }
+        findViewById<Button>(R.id.btnZoomIn).setOnClickListener { send("zoom", "in") }
+        findViewById<Button>(R.id.btnZoomOut).setOnClickListener { send("zoom", "out") }
+        findViewById<Button>(R.id.btnPanL).setOnClickListener { send("pan", "left") }
+        findViewById<Button>(R.id.btnPanR).setOnClickListener { send("pan", "right") }
+        findViewById<Button>(R.id.btnPanU).setOnClickListener { send("pan", "up") }
+        findViewById<Button>(R.id.btnPanD).setOnClickListener { send("pan", "down") }
+        findViewById<Button>(R.id.btnResetView).setOnClickListener { send("resetview") }
         findViewById<Button>(R.id.btnStop).setOnClickListener { send("stop"); finish() }
 
         seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
@@ -196,6 +211,13 @@ class RemoteActivity : AppCompatActivity() {
 
     private fun render(s: JSONObject) {
         last = s
+        val mode = s.optString("mode")
+        viewPanel.visibility = if (mode == "video" || mode == "images") View.VISIBLE else View.GONE
+        val zoom = s.optDouble("zoom", 1.0)
+        // Moving around only makes sense for a zoomed picture.
+        panRow.visibility = if (mode == "images" && zoom > 1.0) View.VISIBLE else View.GONE
+        viewState.text = "Rotate & zoom  ·  ${s.optInt("rotation")}°  ·  " +
+            if (zoom <= 1.0) "no zoom" else "zoom ${"%.2f".format(zoom).trimEnd('0').trimEnd('.')}×"
         when (s.optString("mode")) {
             "video" -> {
                 videoPanel.visibility = View.VISIBLE
@@ -203,6 +225,7 @@ class RemoteActivity : AppCompatActivity() {
                 title.text = s.optString("title")
                 val playing = s.optBoolean("playing")
                 state.text = when {
+                    s.optBoolean("reconnecting") -> "Connection lost — TV is reconnecting and will continue from the same spot…"
                     s.optString("error").isNotEmpty() -> "Cannot play (${s.optString("error")}). Try \"Play in another TV player\"."
                     s.optBoolean("ended") -> "Finished"
                     s.optBoolean("buffering") -> "Buffering…"

@@ -57,6 +57,14 @@ class PlayerActivity : AppCompatActivity(), CastController {
     private var aspect = 0
     private var ticks = 0
     private var cachedPlayers: List<Pair<String, String>> = emptyList()
+    private var reconnecting = false
+    private var rotation = 0
+    private var zoom = 1f
+    private var panX = 0f
+    private var panY = 0f
+    private var reconnectStartedAt = 0L
+    private var resumeAt = 0L
+    private val io = java.util.concurrent.Executors.newSingleThreadExecutor()
 
     private val handler = Handler(Looper.getMainLooper())
     private val ticker = object : Runnable {
@@ -86,9 +94,24 @@ class PlayerActivity : AppCompatActivity(), CastController {
         audio = getSystemService(AUDIO_SERVICE) as AudioManager
         cachedPlayers = externalPlayers(this)
         addControllerButtons()
+        // Video size / layout changes resize the surface, so the rotation fit must be recomputed.
+        val relayout = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyTransform() }
+        (playerView.videoSurfaceView as? View)?.let { surface ->
+            surface.addOnLayoutChangeListener(relayout)
+            // The content frame is sized to the video's shape; let a rotated/zoomed video draw outside it.
+            var p = surface.parent as? ViewGroup
+            while (p != null) {
+                p.clipChildren = false
+                p.clipToPadding = false
+                if (p === playerView) break
+                p = p.parent as? ViewGroup
+            }
+        }
+        image.addOnLayoutChangeListener(relayout)
         Bus.controller = this
         handleRequest()
         handler.post(ticker)
+        handler.postDelayed(heartbeat, 30_000)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -120,34 +143,132 @@ class PlayerActivity : AppCompatActivity(), CastController {
         image.visibility = View.GONE
         playerView.visibility = View.VISIBLE
         val p = player ?: createPlayer()
+        resetView()
+        reconnecting = false
+        handler.removeCallbacks(reconnectStep)
+        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon().clearOverrides().build()
+        p.setPlaybackSpeed(1f)
+        p.setMediaItem(buildItem(r.url, r.sub, r.title), r.startMs.coerceAtLeast(0))
+        p.prepare()
+        p.playWhenReady = true
+        val hint = "Press ☰ for audio, subtitles, rotate, zoom, screen size, volume, VLC/MX"
+        showCaption(if (r.startMs > 0) "${r.title}\nResuming from ${fmt(r.startMs)}\n$hint" else "${r.title}\n$hint", 5000)
+    }
+
+    private fun buildItem(url: String, sub: String?, title: String): MediaItem {
         val item = MediaItem.Builder()
-            .setUri(r.url)
-            .setMediaMetadata(MediaMetadata.Builder().setTitle(r.title).build())
-        if (r.sub != null) {
-            val mime = if (r.sub.endsWith(".vtt")) MimeTypes.TEXT_VTT else MimeTypes.APPLICATION_SUBRIP
+            .setUri(url)
+            .setMediaMetadata(MediaMetadata.Builder().setTitle(title).build())
+        if (sub != null) {
+            val mime = if (sub.endsWith(".vtt")) MimeTypes.TEXT_VTT else MimeTypes.APPLICATION_SUBRIP
             item.setSubtitleConfigurations(
                 listOf(
-                    MediaItem.SubtitleConfiguration.Builder(Uri.parse(r.sub))
+                    MediaItem.SubtitleConfiguration.Builder(Uri.parse(sub))
                         .setMimeType(mime)
                         .setLanguage("en")
-                        .setLabel("External (.${r.sub.substringAfterLast('.')})")
+                        .setLabel("External (.${sub.substringAfterLast('.')})")
                         .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
                         .build()
                 )
             )
         }
-        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon().clearOverrides().build()
-        p.setPlaybackSpeed(1f)
-        p.setMediaItem(item.build(), r.startMs.coerceAtLeast(0))
-        p.prepare()
-        p.playWhenReady = true
-        val hint = "Press ☰ for audio, subtitles, screen size, volume, VLC/MX"
-        showCaption(if (r.startMs > 0) "${r.title}\nResuming from ${fmt(r.startMs)}\n$hint" else "${r.title}\n$hint", 5000)
+        return item.build()
+    }
+
+    /** "http://ip:8090/<token>" part of the current media URL; used for keep-alive and reconnect. */
+    private fun currentBase(): String? {
+        val url = when (mode) {
+            "video" -> videoUrl
+            "images" -> urls.getOrNull(index)
+            else -> null
+        } ?: return null
+        val cut = maxOf(url.lastIndexOf("/v/"), url.lastIndexOf("/i/"))
+        return if (cut > 0) url.substring(0, cut) else null
+    }
+
+    private fun httpOk(url: String): Boolean = try {
+        val c = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+        c.connectTimeout = 3000
+        c.readTimeout = 3000
+        try { c.responseCode in 200..299 } finally { c.disconnect() }
+    } catch (e: Exception) {
+        false
+    }
+
+    /**
+     * Tells the phone every 30 s that the TV is still using it, so the phone's
+     * idle auto-stop never fires while a video is paused or pictures are on screen.
+     */
+    private val heartbeat = object : Runnable {
+        override fun run() {
+            currentBase()?.let { b -> io.execute { httpOk("$b/alive") } }
+            handler.postDelayed(this, 30_000)
+        }
+    }
+
+    private fun latestPhoneBase(): String? =
+        getSharedPreferences("phone", MODE_PRIVATE).getString("base", null)
+
+    /** Network dropped or phone app was closed: keep trying (same position) until the phone is back. */
+    private fun startReconnect() {
+        if (reconnecting) return
+        reconnecting = true
+        reconnectStartedAt = System.currentTimeMillis()
+        resumeAt = player?.currentPosition ?: resumeAt
+        saveProgress()
+        handler.removeCallbacks(reconnectStep)
+        handler.postDelayed(reconnectStep, 2000)
+    }
+
+    private val reconnectStep: Runnable = object : Runnable {
+        override fun run() {
+            if (!reconnecting || mode != "video") return
+            val oldBase = currentBase()
+            val candidates = listOfNotNull(latestPhoneBase(), oldBase).distinct()
+            io.execute {
+                val good = candidates.firstOrNull { httpOk("$it/alive") }
+                runOnUiThread {
+                    if (!reconnecting || isFinishing) return@runOnUiThread
+                    val p = player ?: return@runOnUiThread
+                    if (good != null) {
+                        if (oldBase != null && good != oldBase) {
+                            // Phone got a new IP address: switch the links, keep the position.
+                            videoUrl = videoUrl.replace(oldBase, good)
+                            subUrl = subUrl?.replace(oldBase, good)
+                            p.setMediaItem(buildItem(videoUrl, subUrl, title), resumeAt)
+                        } else {
+                            p.seekTo(resumeAt)
+                        }
+                        p.prepare()
+                        p.playWhenReady = true
+                        showCaption("Reconnected", 2000)
+                        // reconnecting is cleared once the player is READY again
+                    } else {
+                        val waited = (System.currentTimeMillis() - reconnectStartedAt) / 1000
+                        if (waited > RECONNECT_GIVE_UP_S) {
+                            reconnecting = false
+                            showCaption("Phone not reachable. Open TV Cast on the phone and press Play again.", 60_000)
+                            return@runOnUiThread
+                        }
+                        showCaption(
+                            "Connection to phone lost — reconnecting…\n" +
+                                "If the phone was locked for long, open TV Cast on it. Playback will continue from ${fmt(resumeAt)}.",
+                            6000
+                        )
+                        handler.postDelayed(this, 4000)
+                    }
+                }
+            }
+        }
     }
 
     private fun createPlayer(): ExoPlayer {
         val renderers = DefaultRenderersFactory(this).setEnableDecoderFallback(true)
+        // Ride out short Wi-Fi blips silently (retries with back-off, ~30 s) before reporting an error.
+        val sources = androidx.media3.exoplayer.source.DefaultMediaSourceFactory(this)
+            .setLoadErrorHandlingPolicy(androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy(10))
         val p = ExoPlayer.Builder(this, renderers)
+            .setMediaSourceFactory(sources)
             .setAudioAttributes(AudioAttributes.DEFAULT, true)
             .setSeekBackIncrementMs(10_000)
             .setSeekForwardIncrementMs(10_000)
@@ -158,10 +279,19 @@ class PlayerActivity : AppCompatActivity(), CastController {
             .build()
         p.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
-                showCaption("Cannot play: ${error.errorCodeName}\nPress ☰ (menu) to open in VLC / MX Player", 15_000)
+                // 2xxx = network/IO errors: the file is fine, the connection isn't. Reconnect automatically.
+                if (error.errorCode in 2000..2999 && mode == "video") {
+                    startReconnect()
+                } else {
+                    showCaption("Cannot play: ${error.errorCodeName}\nPress ☰ (menu) to open in VLC / MX Player", 15_000)
+                }
             }
 
             override fun onPlaybackStateChanged(state: Int) {
+                if (state == Player.STATE_READY && reconnecting) {
+                    reconnecting = false
+                    handler.removeCallbacks(reconnectStep)
+                }
                 if (state == Player.STATE_ENDED) {
                     saveProgress()
                     showCaption("Finished. Closing in 10 seconds…", 10_000)
@@ -202,6 +332,12 @@ class PlayerActivity : AppCompatActivity(), CastController {
 
     private fun togglePlay() {
         val p = player ?: return
+        if (p.playerError != null) {
+            // After an error, Play means "try again" from where it stopped.
+            reconnecting = false
+            startReconnect()
+            return
+        }
         if (p.playWhenReady && p.playbackState != Player.STATE_ENDED) {
             p.pause()
         } else {
@@ -344,6 +480,16 @@ class PlayerActivity : AppCompatActivity(), CastController {
         entries += "Speed:  ${p.playbackParameters.speed}x" to {
             choose("Speed", SPEEDS.map { "${it}x" }, SPEEDS.indexOf(p.playbackParameters.speed)) { setSpeed(SPEEDS[it]) }
         }
+        entries += "Rotate:  $rotation°" to {
+            choose("Rotate video", listOf("0° (normal)", "90° right", "180° (upside down)", "270° (90° left)"), rotation / 90) {
+                rotation = it * 90; applyTransform(); showCaption("Rotation: $rotation°", 1500)
+            }
+        }
+        entries += "Zoom:  ${if (zoom == 1f) "off" else zoomLabel(zoom)}" to {
+            choose("Zoom", ZOOMS.map { if (it == 1f) "Off (1×)" else zoomLabel(it) }, ZOOMS.indexOfFirst { it >= zoom - 0.01f }) {
+                setZoom(ZOOMS[it])
+            }
+        }
         entries += "Restart from beginning" to { p.seekTo(0); p.play() }
         players.forEach { (pkg, name) -> entries += "Play in $name" to { openExternal(pkg) } }
         entries += "Open with other app…" to { openExternal(null) }
@@ -407,8 +553,103 @@ class PlayerActivity : AppCompatActivity(), CastController {
     private fun showImage(i: Int) {
         if (urls.isEmpty()) return
         index = ((i % urls.size) + urls.size) % urls.size
-        image.load(urls[index], imageLoader(this)) { crossfade(300) }
-        showCaption("${names.getOrElse(index) { "" }}   (${index + 1}/${urls.size})")
+        resetView(apply = false)
+        image.load(urls[index], imageLoader(this)) {
+            crossfade(300)
+            listener(onSuccess = { _, _ -> applyTransform() })
+        }
+        applyTransform()
+        showCaption("${names.getOrElse(index) { "" }}   (${index + 1}/${urls.size})   ·   ☰ rotate / zoom")
+    }
+
+    // ------------------------------------------------------ rotate / zoom
+
+    private fun resetView(apply: Boolean = true) {
+        rotation = 0
+        zoom = 1f
+        panX = 0f
+        panY = 0f
+        if (apply) applyTransform()
+    }
+
+    private fun rotate(deg: Int) {
+        rotation = ((rotation + deg) % 360 + 360) % 360
+        panX = 0f; panY = 0f
+        applyTransform()
+        showCaption("Rotation: $rotation°", 1500)
+    }
+
+    private fun setZoom(z: Float) {
+        zoom = z.coerceIn(1f, ZOOMS.last())
+        if (zoom == 1f) { panX = 0f; panY = 0f }
+        applyTransform()
+        showCaption(if (zoom == 1f) "Zoom: off" else "Zoom: ${zoomLabel(zoom)}" +
+            if (mode == "images" && zoom > 1f) "  ·  arrows to move, Back to reset" else "", 2500)
+    }
+
+    private fun stepZoom(dir: Int) {
+        val i = ZOOMS.indexOfFirst { it >= zoom - 0.01f }.coerceAtLeast(0)
+        setZoom(ZOOMS[(i + dir).coerceIn(0, ZOOMS.size - 1)])
+    }
+
+    private fun pan(dx: Int, dy: Int) {
+        val step = 0.15f * maxOf(image.width, image.height)
+        panX += dx * step
+        panY += dy * step
+        applyTransform()
+    }
+
+    private fun zoomLabel(z: Float) = if (z % 1f == 0f) "${z.toInt()}×" else "${z}×"
+
+    /**
+     * Applies rotation + zoom (+ pan for pictures) to the video surface or the picture.
+     * For 90°/270° the content is shrunk so the rotated frame still fits the screen.
+     */
+    private fun applyTransform() {
+        val target: View = (if (mode == "video") playerView.videoSurfaceView as? View else image) ?: return
+        val cw = (if (mode == "video") playerView.width else image.width).toFloat()
+        val ch = (if (mode == "video") playerView.height else image.height).toFloat()
+        // Size of what is actually visible: the video surface, or the picture as fitted inside the screen.
+        var w = target.width.toFloat()
+        var h = target.height.toFloat()
+        if (mode == "images") {
+            val d = image.drawable
+            if (d != null && d.intrinsicWidth > 0 && d.intrinsicHeight > 0 && cw > 0 && ch > 0) {
+                val sc = minOf(cw / d.intrinsicWidth, ch / d.intrinsicHeight)
+                w = d.intrinsicWidth * sc
+                h = d.intrinsicHeight * sc
+            }
+        }
+        val turned = rotation % 180 != 0
+        val rw = if (turned) h else w
+        val rh = if (turned) w else h
+        // Turned 90°/270°: scale so the rotated frame fills the screen as much as possible.
+        val fit = if (turned && rw > 0 && rh > 0) minOf(cw / rw, ch / rh) else 1f
+        val s = fit * zoom
+        val maxX = maxOf(0f, (rw * s - cw) / 2f)
+        val maxY = maxOf(0f, (rh * s - ch) / 2f)
+        panX = panX.coerceIn(-maxX, maxX)
+        panY = panY.coerceIn(-maxY, maxY)
+        target.rotation = rotation.toFloat()
+        target.scaleX = s
+        target.scaleY = s
+        target.translationX = if (mode == "images") panX else 0f
+        target.translationY = if (mode == "images") panY else 0f
+    }
+
+    private fun showImageMenu() {
+        val entries = listOf<Pair<String, () -> Unit>>(
+            "Rotate right ⟳" to { rotate(90) },
+            "Rotate left ⟲" to { rotate(-90) },
+            "Zoom in" to { stepZoom(1) },
+            "Zoom out" to { stepZoom(-1) },
+            "Reset rotation & zoom" to { resetView(); showCaption("Reset", 1200) },
+            (if (slideshow) "Stop slideshow" else "Start slideshow") to { toggleSlideshow() },
+        )
+        AlertDialog.Builder(this)
+            .setTitle(names.getOrElse(index) { "Picture" })
+            .setItems(entries.map { it.first }.toTypedArray()) { _, which -> entries[which].second() }
+            .show()
     }
 
     private fun toggleSlideshow() {
@@ -429,7 +670,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
         val ms = v?.toLongOrNull()
         when (cmd) {
             "toggle" -> if (mode == "images") toggleSlideshow() else togglePlay()
-            "play" -> player?.play()
+            "play" -> if (player?.playerError != null) togglePlay() else player?.play()
             "pause" -> player?.pause()
             "seek" -> if (ms != null) { player?.seekTo(ms); showCaption(fmt(ms), 1500) }
             "fwd" -> seekBy(ms ?: 10_000)
@@ -447,20 +688,32 @@ class PlayerActivity : AppCompatActivity(), CastController {
             "next" -> showImage(index + 1)
             "prev" -> showImage(index - 1)
             "slideshow" -> toggleSlideshow()
+            "rotate" -> rotate(v?.toIntOrNull() ?: 90)
+            "zoom" -> when (v) {
+                "in" -> stepZoom(1)
+                "out" -> stepZoom(-1)
+                null, "reset" -> setZoom(1f)
+                else -> v.toFloatOrNull()?.let { setZoom(it) }
+            }
+            "resetview" -> { resetView(); showCaption("Reset", 1200) }
+            "pan" -> when (v) {
+                "left" -> pan(1, 0); "right" -> pan(-1, 0); "up" -> pan(0, 1); "down" -> pan(0, -1)
+            }
             "stop" -> finish()
         }
         publishStatus()
     }
 
     private fun publishStatus() {
-        val j = JSONObject().put("mode", mode)
+        val j = JSONObject().put("mode", mode).put("rotation", rotation).put("zoom", zoom.toDouble())
         when (mode) {
             "video" -> {
                 val p = player
                 val err = p?.playerError?.errorCodeName
                 j.put("title", title)
                     .put("key", key)
-                    .put("error", err ?: "")
+                    .put("error", if (reconnecting) "" else err ?: "")
+                    .put("reconnecting", reconnecting)
                     .put("playing", p != null && err == null && p.playWhenReady && p.playbackState != Player.STATE_ENDED)
                     .put("buffering", p != null && p.playbackState == Player.STATE_BUFFERING)
                     .put("ended", p != null && p.playbackState == Player.STATE_ENDED)
@@ -496,6 +749,22 @@ class PlayerActivity : AppCompatActivity(), CastController {
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val down = event.action == KeyEvent.ACTION_DOWN
         if (mode == "images") {
+            if (event.keyCode == KeyEvent.KEYCODE_MENU) {
+                if (down) showImageMenu()
+                return true
+            }
+            if (zoom > 1f) {
+                // Zoomed in: arrows move around the picture, Back returns to normal view.
+                val handled = when (event.keyCode) {
+                    KeyEvent.KEYCODE_DPAD_LEFT -> { if (down) pan(1, 0); true }
+                    KeyEvent.KEYCODE_DPAD_RIGHT -> { if (down) pan(-1, 0); true }
+                    KeyEvent.KEYCODE_DPAD_UP -> { if (down) pan(0, 1); true }
+                    KeyEvent.KEYCODE_DPAD_DOWN -> { if (down) pan(0, -1); true }
+                    KeyEvent.KEYCODE_BACK -> { if (down) { setZoom(1f) }; true }
+                    else -> false
+                }
+                if (handled) return true
+            }
             val handled = when (event.keyCode) {
                 KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_MEDIA_REWIND, KeyEvent.KEYCODE_MEDIA_PREVIOUS -> {
                     if (down) { stopSlideshow(); showImage(index - 1) }; true
@@ -535,6 +804,8 @@ class PlayerActivity : AppCompatActivity(), CastController {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
+        reconnecting = false
+        io.shutdownNow()
         releasePlayer()
         if (Bus.controller === this) {
             Bus.controller = null
@@ -551,6 +822,8 @@ class PlayerActivity : AppCompatActivity(), CastController {
 
     companion object {
         private const val SLIDE_MS = 5000L
+        private const val RECONNECT_GIVE_UP_S = 15 * 60
+        private val ZOOMS = listOf(1f, 1.25f, 1.5f, 2f, 2.5f, 3f)
         private val SPEEDS = listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 1.75f, 2f)
         private val ASPECTS = listOf(
             AspectRatioFrameLayout.RESIZE_MODE_FIT to "Fit",

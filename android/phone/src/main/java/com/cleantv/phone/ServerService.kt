@@ -7,6 +7,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.Handler
 import android.os.IBinder
@@ -17,6 +21,13 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import fi.iki.elonen.NanoHTTPD
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /** Keeps the media server alive while the screen is off or the app is in background. */
 class ServerService : Service() {
@@ -39,7 +50,7 @@ class ServerService : Service() {
         val notification = NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat)
             .setContentTitle("TV Cast is sharing your media")
-            .setContentText("Stops by itself after 1 hour without playback")
+            .setContentText("Stays on while the TV is using it · stops 1 hour after the TV closes")
             .setContentIntent(openPi)
             .addAction(0, "Stop", stopPi)
             .setOngoing(true)
@@ -58,6 +69,39 @@ class ServerService : Service() {
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "tvcast:server").apply { acquire() }
         running = true
         handler.postDelayed(idleCheck, IDLE_CHECK_MS)
+        watchNetwork()
+    }
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var netCallback: ConnectivityManager.NetworkCallback? = null
+    private var announceJob: Job? = null
+
+    /**
+     * When Wi-Fi reconnects or the phone gets a new IP (router restart, hotspot toggled),
+     * tell the TV the new address so a paused/reconnecting video can continue by itself.
+     */
+    private fun watchNetwork() {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) = announceSoon()
+            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) = announceSoon()
+        }
+        try {
+            cm.registerNetworkCallback(NetworkRequest.Builder().build(), cb)
+            netCallback = cb
+        } catch (e: Exception) {
+            Log.w("TvCast", "network callback failed", e)
+        }
+    }
+
+    private fun announceSoon() {
+        scope.launch {
+            announceJob?.cancel()
+            announceJob = launch {
+                delay(3000) // let the new address settle
+                if (Prefs.lastTv(this@ServerService) != null) TvClient.ensure(this@ServerService)
+            }
+        }
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -86,6 +130,8 @@ class ServerService : Service() {
 
     override fun onDestroy() {
         handler.removeCallbacks(idleCheck)
+        netCallback?.let { runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) } }
+        scope.cancel()
         server?.stop()
         wifiLock?.takeIf { it.isHeld }?.release()
         wakeLock?.takeIf { it.isHeld }?.release()
