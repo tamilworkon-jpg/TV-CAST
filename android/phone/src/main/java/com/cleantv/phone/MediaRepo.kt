@@ -15,6 +15,8 @@ data class Media(
     val size: Long,
     val durationMs: Long,
     val isVideo: Boolean,
+    val folder: String = "",
+    val dateAdded: Long = 0,
 ) {
     /** Stable identity across MediaStore rescans; used for resume history. */
     val key: String get() = "$name|$size"
@@ -34,11 +36,14 @@ object MediaRepo {
             MediaStore.Video.Media.DISPLAY_NAME,
             MediaStore.Video.Media.SIZE,
             MediaStore.Video.Media.DURATION,
+            MediaStore.Video.Media.BUCKET_DISPLAY_NAME,
+            MediaStore.Video.Media.DATE_ADDED,
         )
         ctx.contentResolver.query(videoCollection, proj, null, null, "${MediaStore.Video.Media.DATE_ADDED} DESC")?.use { c ->
             while (c.moveToNext()) {
                 val id = c.getLong(0)
-                out += Media(id, videoUri(id), c.getString(1) ?: "video", c.getLong(2), c.getLong(3), true)
+                out += Media(id, videoUri(id), c.getString(1) ?: "video", c.getLong(2), c.getLong(3), true,
+                    c.getString(4) ?: "Other", c.getLong(5))
             }
         }
         return out
@@ -50,11 +55,14 @@ object MediaRepo {
             MediaStore.Images.Media._ID,
             MediaStore.Images.Media.DISPLAY_NAME,
             MediaStore.Images.Media.SIZE,
+            MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
+            MediaStore.Images.Media.DATE_ADDED,
         )
         ctx.contentResolver.query(imageCollection, proj, null, null, "${MediaStore.Images.Media.DATE_ADDED} DESC")?.use { c ->
             while (c.moveToNext()) {
                 val id = c.getLong(0)
-                out += Media(id, imageUri(id), c.getString(1) ?: "picture", c.getLong(2), 0, false)
+                out += Media(id, imageUri(id), c.getString(1) ?: "picture", c.getLong(2), 0, false,
+                    c.getString(3) ?: "Other", c.getLong(4))
             }
         }
         return out
@@ -92,7 +100,7 @@ object MediaRepo {
         val v = JSONArray()
         for (m in videos(ctx)) {
             val o = JSONObject().put("id", m.id).put("name", m.name).put("size", m.size)
-                .put("dur", m.durationMs).put("key", m.key)
+                .put("dur", m.durationMs).put("key", m.key).put("folder", m.folder).put("date", m.dateAdded)
             paths[m.id]?.let { p ->
                 val f = File(p)
                 val dir = f.parent ?: return@let
@@ -102,7 +110,10 @@ object MediaRepo {
             v.put(o)
         }
         val i = JSONArray()
-        for (m in images(ctx)) i.put(JSONObject().put("id", m.id).put("name", m.name))
+        for (m in images(ctx)) i.put(
+            JSONObject().put("id", m.id).put("name", m.name).put("size", m.size)
+                .put("folder", m.folder).put("date", m.dateAdded)
+        )
         return JSONObject().put("videos", v).put("images", i).toString()
     }
 }

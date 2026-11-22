@@ -36,18 +36,35 @@ class MainActivity : AppCompatActivity() {
     private lateinit var list: RecyclerView
     private lateinit var empty: TextView
     private lateinit var tvLabel: TextView
+    private lateinit var chipSort: com.google.android.material.chip.Chip
+    private lateinit var chipFolder: com.google.android.material.chip.Chip
+    private lateinit var chipShow: com.google.android.material.chip.Chip
+    private lateinit var chipReset: com.google.android.material.chip.Chip
+    private lateinit var search: EditText
     private val adapter = MediaAdapter { pos -> onItemClick(pos) }
     private var videos = emptyList<Media>()
     private var images = emptyList<Media>()
     private var recent = emptyList<Media>()
     private var history: Map<String, Progress> = emptyMap()
     private var tab = TAB_VIDEOS
+    private lateinit var videoFilter: Filter
+    private lateinit var imageFilter: Filter
+    private var shown = emptyList<Media>()
 
+    private var filter: Filter
+        get() = if (tab == TAB_PICTURES) imageFilter else videoFilter
+        set(f) {
+            if (tab == TAB_PICTURES) { imageFilter = f; f.save(this, "images") }
+            else { videoFilter = f; f.save(this, "videos") }
+            render()
+        }
+
+    /** What the grid shows: the tab's items after sort / category / filter / search. */
     private val currentItems: List<Media>
         get() = when (tab) {
-            TAB_RECENT -> recent
-            TAB_VIDEOS -> videos
-            else -> images
+            TAB_RECENT -> videoFilter.apply(recent, history, keepOrder = true)
+            TAB_VIDEOS -> videoFilter.apply(videos, history)
+            else -> imageFilter.apply(images, history)
         }
 
     private val mediaPermissions: Array<String>
@@ -92,6 +109,26 @@ class MainActivity : AppCompatActivity() {
             else startActivity(Intent(this, RemoteActivity::class.java))
         }
         findViewById<Button>(R.id.btnClear).setOnClickListener { confirmClear() }
+
+        videoFilter = Filter.load(this, "videos")
+        imageFilter = Filter.load(this, "images")
+        chipSort = findViewById(R.id.chipSort)
+        chipFolder = findViewById(R.id.chipFolder)
+        chipShow = findViewById(R.id.chipShow)
+        chipReset = findViewById(R.id.chipReset)
+        search = findViewById(R.id.search)
+        chipSort.setOnClickListener { pickSort() }
+        chipFolder.setOnClickListener { pickFolder() }
+        chipShow.setOnClickListener { pickShow() }
+        chipReset.setOnClickListener { search.setText(""); filter = Filter() }
+        search.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) {
+                val q = s?.toString().orEmpty()
+                if (q != filter.query) filter = filter.copy(query = q)
+            }
+        })
 
         if (hasMediaPermission()) maybeAskAllFilesAccess() else permLauncher.launch(mediaPermissions)
     }
@@ -155,16 +192,68 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun render() {
+        if (!::videoFilter.isInitialized) return
         val items = currentItems
+        shown = items
         val span = if (tab == TAB_PICTURES) 3 else 2
         (list.layoutManager as GridLayoutManager).spanCount = span
         adapter.submit(items, span, history)
+        updateChips(items.size)
         empty.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
         empty.text = when {
             !hasMediaPermission() -> "Permission needed to read your media"
+            !filter.isDefault -> "Nothing matches these filters.\nTap Reset to show everything."
             tab == TAB_RECENT -> "Nothing played yet"
             else -> "Nothing found"
         }
+    }
+
+    private fun updateChips(count: Int) {
+        val f = filter
+        val pictures = tab == TAB_PICTURES
+        chipSort.text = if (tab == TAB_RECENT) "Sort: Last played" else "Sort: ${f.sort.label}"
+        chipSort.isEnabled = tab != TAB_RECENT
+        chipFolder.text = "Category: ${f.folder ?: "All"}"
+        chipFolder.isChecked = f.folder != null
+        chipShow.visibility = if (pictures) View.GONE else View.VISIBLE
+        chipShow.text = "Show: ${f.show.label}"
+        chipShow.isChecked = f.show != Show.ALL
+        chipReset.visibility = if (f.isDefault) View.GONE else View.VISIBLE
+        chipReset.text = "Reset ($count)"
+        search.hint = if (pictures) "Search ${images.size} pictures" else "Search ${videos.size} videos"
+        if (search.text.toString() != f.query) search.setText(f.query)
+    }
+
+    private fun choose(title: String, labels: List<String>, checked: Int, onPick: (Int) -> Unit) {
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setSingleChoiceItems(labels.toTypedArray(), checked) { d, which -> onPick(which); d.dismiss() }
+            .show()
+    }
+
+    private fun pickSort() {
+        val options = SortBy.entries.filter { tab != TAB_PICTURES || it.forPictures }
+        choose("Sort by", options.map { it.label }, options.indexOf(filter.sort)) { filter = filter.copy(sort = options[it]) }
+    }
+
+    /** Categories are the phone's folders (Download, Camera, WhatsApp Video…), with item counts. */
+    private fun pickFolder() {
+        val source = if (tab == TAB_PICTURES) images else if (tab == TAB_RECENT) recent else videos
+        val counts = source.groupingBy { it.folder }.eachCount().toList().sortedByDescending { it.second }
+        val folders = listOf<String?>(null) + counts.map { it.first }
+        val labels = listOf("All (${source.size})") + counts.map { "${it.first} (${it.second})" }
+        choose("Category (folder)", labels, folders.indexOf(filter.folder).coerceAtLeast(0)) {
+            filter = filter.copy(folder = folders[it])
+        }
+    }
+
+    private fun pickShow() {
+        val options = Show.entries
+        val labels = options.map { s ->
+            val n = Filter(show = s).apply(if (tab == TAB_RECENT) recent else videos, history).size
+            "${s.label} ($n)"
+        }
+        choose("Show", labels, options.indexOf(filter.show)) { filter = filter.copy(show = options[it]) }
     }
 
     private fun updateTvLabel(connected: Boolean? = null) {
@@ -181,8 +270,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onItemClick(pos: Int) {
-        val item = currentItems.getOrNull(pos) ?: return
-        val imageSnapshot = images
+        val item = shown.getOrNull(pos) ?: return
+        // Slideshow follows what's on screen (filtered/sorted pictures).
+        val imageSnapshot = if (item.isVideo) emptyList() else shown
         val imageIndex = if (item.isVideo) 0 else pos
         lifecycleScope.launch {
             val startMs = if (item.isVideo) askResume(item) ?: return@launch else 0L

@@ -25,7 +25,29 @@ class MainActivity : AppCompatActivity() {
     private data class Item(
         val id: Long, val name: String, val size: Long, val dur: Long,
         val key: String, val sub: String?, val video: Boolean,
+        val folder: String = "", val date: Long = 0,
     )
+
+    private val sorts = listOf("Newest first", "Oldest first", "Name A–Z", "Name Z–A",
+        "Size: largest first", "Size: smallest first", "Length: longest first", "Length: shortest first")
+    private val shows = listOf("All", "Movies (40 min+)", "Short videos (< 40 min)", "Not started", "Continue watching", "Watched")
+    // Separate choices for videos and pictures, remembered across restarts.
+    private val fsp by lazy { getSharedPreferences("filters", Context.MODE_PRIVATE) }
+    private fun group() = if (tab == TAB_PICTURES) "images" else "videos"
+    private var sortIdx: Int
+        get() = fsp.getInt("${group()}.sort", 0)
+        set(v) { fsp.edit().putInt("${group()}.sort", v).apply() }
+    private var folder: String?
+        get() = fsp.getString("${group()}.folder", null)
+        set(v) { fsp.edit().putString("${group()}.folder", v).apply() }
+    private var showIdx: Int
+        get() = if (tab == TAB_PICTURES) 0 else fsp.getInt("videos.show", 0)
+        set(v) { fsp.edit().putInt("videos.show", v).apply() }
+
+    private lateinit var btnSort: TextView
+    private lateinit var btnFolder: TextView
+    private lateinit var btnShow: TextView
+    private lateinit var btnReset: TextView
 
     private lateinit var grid: RecyclerView
     private lateinit var empty: TextView
@@ -40,6 +62,8 @@ class MainActivity : AppCompatActivity() {
     private var images = emptyList<Item>()
     private var history: Map<String, JSONObject> = emptyMap()
     private var tab = TAB_VIDEOS
+    private var shown = emptyList<Item>()
+    private lateinit var countLabel: TextView
     private var firstLoad = true
     private var offline = false
 
@@ -71,7 +95,94 @@ class MainActivity : AppCompatActivity() {
                 .setNegativeButton("Cancel", null)
                 .show()
         }
+        btnSort = findViewById(R.id.btnSort)
+        countLabel = findViewById(R.id.count)
+        btnFolder = findViewById(R.id.btnFolder)
+        btnShow = findViewById(R.id.btnShow)
+        btnReset = findViewById(R.id.btnReset)
+        btnSort.setOnClickListener {
+            val options = if (tab == TAB_PICTURES) sorts.take(6) else sorts
+            choose("Sort by", options, sortIdx) { sortIdx = it; render() }
+        }
+        btnFolder.setOnClickListener {
+            val source = baseList()
+            val counts = source.groupingBy { it.folder }.eachCount().toList().sortedByDescending { it.second }
+            val folders = listOf<String?>(null) + counts.map { it.first }
+            val labels = listOf("All (${source.size})") + counts.map { "${it.first} (${it.second})" }
+            choose("Category (folder)", labels, folders.indexOf(folder).coerceAtLeast(0)) { folder = folders[it]; render() }
+        }
+        btnShow.setOnClickListener {
+            val labels = shows.mapIndexed { i, s -> "$s (${baseList().count { matchesShow(it, i) }})" }
+            choose("Show", labels, showIdx) { showIdx = it; render() }
+        }
+        btnReset.setOnClickListener {
+            sortIdx = 0; folder = null; if (tab != TAB_PICTURES) showIdx = 0
+            render()
+        }
         tabs[TAB_VIDEOS].requestFocus()
+    }
+
+    private fun choose(title: String, labels: List<String>, checked: Int, onPick: (Int) -> Unit) {
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setSingleChoiceItems(labels.toTypedArray(), checked) { d, which -> onPick(which); d.dismiss() }
+            .show()
+    }
+
+    /** The tab's items before any filtering. */
+    private fun baseList(): List<Item> = when (tab) {
+        TAB_RECENT -> {
+            val byKey = videos.associateBy { it.key }
+            val h = History.all(this)
+            (0 until h.length()).mapNotNull { byKey[h.getJSONObject(it).optString("key")] }
+        }
+        TAB_VIDEOS -> videos
+        else -> images
+    }
+
+    private fun matchesShow(m: Item, show: Int): Boolean {
+        val h = history[m.key]
+        val pos = h?.optLong("pos") ?: 0L
+        val dur = h?.optLong("dur") ?: 0L
+        return when (show) {
+            1 -> m.dur >= MOVIE_MS
+            2 -> m.dur < MOVIE_MS
+            3 -> h == null
+            4 -> h != null && pos > 10_000 && pos < dur - 30_000
+            5 -> h != null && dur > 0 && pos >= dur - 30_000
+            else -> true
+        }
+    }
+
+    private fun applyFilters(list: List<Item>): List<Item> {
+        val f = folder
+        val show = showIdx
+        val filtered = list.filter { (f == null || it.folder == f) && matchesShow(it, show) }
+        if (tab == TAB_RECENT) return filtered
+        return when (sortIdx) {
+            1 -> filtered.sortedBy { it.date }
+            2 -> filtered.sortedBy { it.name.lowercase() }
+            3 -> filtered.sortedByDescending { it.name.lowercase() }
+            4 -> filtered.sortedByDescending { it.size }
+            5 -> filtered.sortedBy { it.size }
+            6 -> filtered.sortedByDescending { it.dur }
+            7 -> filtered.sortedBy { it.dur }
+            else -> filtered.sortedByDescending { it.date }
+        }
+    }
+
+    private fun updateFilterButtons(count: Int) {
+        val pictures = tab == TAB_PICTURES
+        btnSort.text = if (tab == TAB_RECENT) "Sort: Last played" else "Sort: ${sorts.getOrElse(sortIdx) { sorts[0] }}"
+        btnSort.isEnabled = tab != TAB_RECENT
+        btnSort.alpha = if (tab == TAB_RECENT) 0.5f else 1f
+        btnFolder.text = "Category: ${folder ?: "All"}"
+        btnShow.visibility = if (pictures) View.GONE else View.VISIBLE
+        btnShow.text = "Show: ${shows[showIdx]}"
+        val filtered = folder != null || showIdx != 0 || (sortIdx != 0 && tab != TAB_RECENT)
+        btnReset.visibility = if (filtered) View.VISIBLE else View.GONE
+        btnReset.text = "Reset"
+        countLabel.text = "$count ${if (pictures) "pictures" else "videos"}"
     }
 
     override fun onResume() {
@@ -133,12 +244,14 @@ class MainActivity : AppCompatActivity() {
         videos = List(v.length()) {
             val j = v.getJSONObject(it)
             Item(j.getLong("id"), j.optString("name"), j.optLong("size"), j.optLong("dur"),
-                j.optString("key"), j.optString("sub").takeIf { s -> s.isNotEmpty() }, true)
+                j.optString("key"), j.optString("sub").takeIf { s -> s.isNotEmpty() }, true,
+                j.optString("folder", "Other"), j.optLong("date"))
         }
         val i = o.getJSONArray("images")
         images = List(i.length()) {
             val j = i.getJSONObject(it)
-            Item(j.getLong("id"), j.optString("name"), 0, 0, "", null, false)
+            Item(j.getLong("id"), j.optString("name"), j.optLong("size"), 0, "", null, false,
+                j.optString("folder", "Other"), j.optLong("date"))
         }
     }
 
@@ -155,21 +268,18 @@ class MainActivity : AppCompatActivity() {
         tabs.forEachIndexed { i, v -> v.isSelected = i == tab }
         val h = History.all(this)
         history = (0 until h.length()).map { h.getJSONObject(it) }.associateBy { it.optString("key") }
-        val list = when (tab) {
-            TAB_RECENT -> {
-                val byKey = videos.associateBy { it.key }
-                (0 until h.length()).mapNotNull { byKey[h.getJSONObject(it).optString("key")] }
-            }
-            TAB_VIDEOS -> videos
-            else -> images
-        }
+        val all = baseList()
+        val list = applyFilters(all)
+        shown = list
+        updateFilterButtons(list.size)
         (grid.layoutManager as GridLayoutManager).spanCount = if (tab == TAB_PICTURES) 5 else 4
         adapter.submit(list)
         if (list.isEmpty() && base != null && !offline) {
             showEmpty(
-                when (tab) {
-                    TAB_RECENT -> "Nothing to continue yet.\nVideos you start will show up here for 30 days."
-                    TAB_VIDEOS -> "No videos found on $phoneName."
+                when {
+                    all.isNotEmpty() -> "Nothing matches these filters.\nChoose Reset to show everything."
+                    tab == TAB_RECENT -> "Nothing to continue yet.\nVideos you start will show up here for 30 days."
+                    tab == TAB_VIDEOS -> "No videos found on $phoneName."
                     else -> "No pictures found on $phoneName."
                 }
             )
@@ -187,7 +297,8 @@ class MainActivity : AppCompatActivity() {
     private fun open(item: Item, index: Int) {
         val b = base ?: return
         if (!item.video) {
-            Bus.pending = CastRequest.Images(images.map { "$b/i/${it.id}" }, images.map { it.name }, images.indexOf(item).coerceAtLeast(0))
+            val pics = shown.filter { !it.video }
+            Bus.pending = CastRequest.Images(pics.map { "$b/i/${it.id}" }, pics.map { it.name }, pics.indexOf(item).coerceAtLeast(0))
             startActivity(Intent(this, PlayerActivity::class.java))
             return
         }
@@ -288,5 +399,6 @@ class MainActivity : AppCompatActivity() {
         private const val TAB_RECENT = 0
         private const val TAB_VIDEOS = 1
         private const val TAB_PICTURES = 2
+        private const val MOVIE_MS = 40 * 60 * 1000L
     }
 }
