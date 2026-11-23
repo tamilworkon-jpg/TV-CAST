@@ -47,4 +47,5 @@ dependencies {
     implementation("androidx.media3:media3-ui:1.3.1")
     implementation("org.nanohttpd:nanohttpd:2.3.1")
     implementation("io.coil-kt:coil:2.6.0")
+    implementation("com.wireguard.android:tunnel:1.0.20230706")
 }

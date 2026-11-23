@@ -107,6 +107,18 @@ object Auth {
         return MessageDigest.isEqual(expected.toByteArray(), sig.lowercase().toByteArray())
     }
 
+    /** Decrypts a value the phone sealed with its pairing key (phone side: PhoneAuth.seal). */
+    fun unseal(ctx: Context, phoneId: String, sealed: String): String? = try {
+        val key = phones(ctx).optJSONObject(phoneId)?.optString("key")?.takeIf { it.isNotEmpty() }!!
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(unhex(key), "HmacSHA256"))
+        val aes = SecretKeySpec(mac.doFinal("tvcast-seal".toByteArray()), "AES")
+        val raw = android.util.Base64.decode(sealed, android.util.Base64.NO_WRAP)
+        val c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+        c.init(javax.crypto.Cipher.DECRYPT_MODE, aes, javax.crypto.spec.GCMParameterSpec(128, raw, 0, 12))
+        String(c.doFinal(raw, 12, raw.size - 12))
+    } catch (e: Exception) { null }
+
     fun sign(keyHex: String, method: String, path: String, query: String?, ts: Long, body: ByteArray): String {
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(unhex(keyHex), "HmacSHA256"))

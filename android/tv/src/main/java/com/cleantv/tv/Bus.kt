@@ -12,6 +12,8 @@ data class VideoItem(
     val online: Boolean = false,
     val radio: Boolean = false,
     val artwork: String? = null,
+    /** Stream is HLS even though the URL doesn't end in .m3u8. */
+    val hls: Boolean = false,
 )
 
 sealed class CastRequest {

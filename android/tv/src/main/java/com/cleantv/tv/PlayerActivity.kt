@@ -169,7 +169,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
             .setMediaId(v.key)
             .setMediaMetadata(MediaMetadata.Builder().setTitle(v.title).build())
         val path = Uri.parse(v.url).path.orEmpty().lowercase()
-        if (path.endsWith(".m3u8")) item.setMimeType(MimeTypes.APPLICATION_M3U8)
+        if (path.endsWith(".m3u8") || v.hls) item.setMimeType(MimeTypes.APPLICATION_M3U8)
         if (path.endsWith(".mpd")) item.setMimeType(MimeTypes.APPLICATION_MPD)
         v.sub?.let { sub ->
             val mime = if (sub.endsWith(".vtt")) MimeTypes.TEXT_VTT else MimeTypes.APPLICATION_SUBRIP
@@ -947,7 +947,8 @@ class PlayerActivity : AppCompatActivity(), CastController {
                     .put("key", key)
                     .put("online", c?.online == true)
                     .put("radio", c?.radio == true)
-                    .put("vpn", c?.online == true && AdBlock.vpnActive(this))
+                    .put("vpn", c?.online == true && (Vpn.up || AdBlock.vpnActive(this)))
+                    .put("vpnName", if (Vpn.up) Vpn.provider(this) else "")
                     .put("qIndex", p?.currentMediaItemIndex ?: 0)
                     .put("qCount", queue.size)
                     .put("error", if (reconnecting) "" else err ?: "")
@@ -1050,6 +1051,8 @@ class PlayerActivity : AppCompatActivity(), CastController {
         sayBye()
         io.shutdownNow()
         releasePlayer()
+        // Built-in VPN is only for online playback; close it with the player unless another link is starting.
+        if (Bus.pending == null) Vpn.downAsync()
         if (Bus.controller === this) {
             Bus.controller = null
             Bus.status = Bus.IDLE

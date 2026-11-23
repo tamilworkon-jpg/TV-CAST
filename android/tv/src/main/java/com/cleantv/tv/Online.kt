@@ -18,13 +18,36 @@ import java.net.URL
 object Online {
     private const val MAX_PAGE = 3 * 1024 * 1024
 
-    fun open(ctx: Context, url: String, title: String) {
+    /** Turns the built-in VPN on (or off when [vpn] is false). Returns false if it was wanted but failed. */
+    fun vpnReady(ctx: Context, vpn: Boolean): Boolean {
+        if (!vpn) { Vpn.down(); return true }
+        if (Vpn.up) return true
+        toast(ctx, "Connecting VPN…")
+        if (Vpn.ensureUp(ctx)) return true
+        toast(ctx, "${Vpn.error ?: "VPN failed"}. Not playing. Turn off \"Use VPN\" on the phone to play without it.")
+        return false
+    }
+
+    fun radio(ctx: Context, item: VideoItem, vpn: Boolean) {
+        if (vpnReady(ctx, vpn)) play(ctx, CastRequest.Video(listOf(item), 0, 0))
+    }
+
+    fun open(ctx: Context, url: String, title: String, vpn: Boolean) {
         val uri = Uri.parse(url)
         val host = uri.host?.lowercase().orEmpty()
         try {
             when {
                 AdBlock.isBlocked(host) -> toast(ctx, "That link is an ad/tracker address and was blocked.")
-                host.endsWith("youtube.com") || host == "youtu.be" -> openYouTube(ctx, uri)
+                !vpnReady(ctx, vpn) -> Unit
+                YouTube.isYouTube(host) -> {
+                    toast(ctx, "Loading YouTube video…")
+                    val item = runCatching { YouTube.resolve(url) }.getOrNull()
+                    if (item != null) play(ctx, CastRequest.Video(listOf(item), 0, 0))
+                    else {
+                        toast(ctx, "Couldn't play it here, opening the YouTube app…")
+                        openYouTube(ctx, url)
+                    }
+                }
                 host == "photos.app.goo.gl" || host == "photos.google.com" || host == "goo.gl" -> {
                     toast(ctx, "Loading Google Photos album…")
                     val pics = GooglePhotos.resolve(url)
@@ -50,8 +73,10 @@ object Online {
         ctx.startActivity(Intent(ctx, PlayerActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 
-    private fun openYouTube(ctx: Context, uri: Uri) {
-        val i = Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    private fun openYouTube(ctx: Context, link: String) {
+        // The Fire TV YouTube app ignores youtu.be / shorts links; it only opens watch?v= links.
+        val uri = Uri.parse(YouTube.watchUrl(link) ?: link)
+        val i = Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         val yt = Intent(i).setPackage("com.amazon.firetv.youtube")
         try {
             ctx.startActivity(yt)

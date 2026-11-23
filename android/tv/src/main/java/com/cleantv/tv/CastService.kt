@@ -155,16 +155,25 @@ class CastServer(private val ctx: Context) : NanoHTTPD(PORT) {
             // Online link: resolved off the request thread (may need to load a web page first).
             val j = JSONObject(body)
             val url = safeUrl(j.getString("url"))
-            worker.execute { Online.open(ctx, url, j.optString("title")) }
+            worker.execute { Online.open(ctx, url, j.optString("title"), j.optBoolean("vpn", true)) }
             ok()
         }
         "/radio" -> {
             val j = JSONObject(body)
             val item = VideoItem(safeUrl(j.getString("url")), j.optString("name", "Radio"), online = true, radio = true,
                 artwork = j.optString("favicon").takeIf { it.startsWith("http") })
-            Bus.pending = CastRequest.Video(listOf(item), 0, 0)
-            openPlayer()
+            worker.execute { Online.radio(ctx, item, j.optBoolean("vpn", true)) }
             ok()
+        }
+        "/vpn" -> {
+            // Built-in VPN server, encrypted by the phone: a WireGuard config, or "" for Cloudflare WARP.
+            val j = JSONObject(body)
+            val config = Auth.unseal(ctx, s.headers["x-phone"].orEmpty(), j.optString("sealed"))
+            if (config == null || !Vpn.setCustom(ctx, config)) status(Response.Status.BAD_REQUEST, "invalid WireGuard config")
+            else {
+                worker.execute { Vpn.down() }
+                json(JSONObject().put("provider", Vpn.provider(ctx)).toString())
+            }
         }
         "/control" -> {
             val cmd = s.parameters["cmd"]?.firstOrNull().orEmpty()

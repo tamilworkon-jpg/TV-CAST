@@ -321,7 +321,8 @@ class RemoteActivity : AppCompatActivity() {
                     else -> "Paused"
                 } + when {
                     s.optBoolean("radio") -> "  ·  Live radio"
-                    online -> "  ·  Private link · ads blocked · VPN ${if (s.optBoolean("vpn")) "on" else "off"}"
+                    online -> "  ·  Private link · ads blocked · " +
+                        (if (s.optBoolean("vpn")) "VPN on ${s.optString("vpnName")}".trim() else "VPN off")
                     q > 1 -> "  ·  ${s.optInt("qIndex") + 1} of $q"
                     else -> ""
                 }

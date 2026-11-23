@@ -42,6 +42,18 @@ object PhoneAuth {
         return mapOf("X-Phone" to phoneId(ctx), "X-Ts" to ts.toString(), "X-Sig" to hex(mac.doFinal(msg.toByteArray())))
     }
 
+    /** Encrypts [text] for the paired TV (AES-256-GCM with a key derived from the pairing key). */
+    fun seal(ctx: Context, tvId: String, text: String): String? {
+        val key = key(ctx, tvId) ?: return null
+        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+        mac.init(javax.crypto.spec.SecretKeySpec(unhex(key), "HmacSHA256"))
+        val aes = javax.crypto.spec.SecretKeySpec(mac.doFinal("tvcast-seal".toByteArray()), "AES")
+        val iv = ByteArray(12).also { rng.nextBytes(it) }
+        val c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+        c.init(javax.crypto.Cipher.ENCRYPT_MODE, aes, javax.crypto.spec.GCMParameterSpec(128, iv))
+        return android.util.Base64.encodeToString(iv + c.doFinal(text.toByteArray()), android.util.Base64.NO_WRAP)
+    }
+
     private fun hex(b: ByteArray) = b.joinToString("") { "%02x".format(it) }
     private fun unhex(s: String) = ByteArray(s.length / 2) { s.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
 }
@@ -238,11 +250,20 @@ object TvClient {
         return spost(tv, "/images", j.toString(), 10_000) != null
     }
 
-    /** Online link (video page, stream, YouTube, Google Photos album). Private: nothing is stored on either side. */
-    fun url(tv: Tv, url: String): Boolean = spost(tv, "/url", JSONObject().put("url", url).toString()) != null
+    /** Online link (video page, stream, YouTube, Google Photos album). The TV keeps nothing about it. */
+    fun url(tv: Tv, url: String, vpn: Boolean): Boolean =
+        spost(tv, "/url", JSONObject().put("url", url).put("vpn", vpn).toString()) != null
 
-    fun radio(tv: Tv, url: String, name: String, favicon: String?): Boolean =
-        spost(tv, "/radio", JSONObject().put("url", url).put("name", name).put("favicon", favicon ?: "").toString()) != null
+    fun radio(tv: Tv, url: String, name: String, favicon: String?, vpn: Boolean): Boolean =
+        spost(tv, "/radio", JSONObject().put("url", url).put("name", name).put("favicon", favicon ?: "").put("vpn", vpn).toString()) != null
+
+    /** Sets the TV's built-in VPN server: a WireGuard config, or blank for Cloudflare WARP. Returns the provider name. */
+    fun vpnConfig(tv: Tv, config: String): String? {
+        val sealed = PhoneAuth.seal(app, tv.id, config) ?: return null
+        return spost(tv, "/vpn", JSONObject().put("sealed", sealed).toString(), 5000)?.let {
+            runCatching { JSONObject(it).optString("provider") }.getOrNull()
+        }
+    }
 
     fun control(tv: Tv, cmd: String, v: String? = null): Boolean =
         sget(tv, "/control?cmd=$cmd" + (v?.let { "&v=" + URLEncoder.encode(it, "UTF-8") } ?: "")) != null
@@ -289,7 +310,25 @@ object Prefs {
 
     fun saveHistory(ctx: Context, json: String) = sp(ctx).edit().putString("history", json).apply()
 
-    fun clearHistory(ctx: Context) = sp(ctx).edit().remove("history").apply()
+    fun clearHistory(ctx: Context) = sp(ctx).edit().remove("history").remove("links").apply()
+
+    /** Built-in VPN for links/radio on the TV (on unless turned off). */
+    fun vpn(ctx: Context) = sp(ctx).getBoolean("vpn", true)
+    fun setVpn(ctx: Context, on: Boolean) = sp(ctx).edit().putBoolean("vpn", on).apply()
+
+    /** Links played on the TV, kept only on this phone (newest first, cleared with Clear history). */
+    fun links(ctx: Context): List<String> = try {
+        val a = JSONArray(sp(ctx).getString("links", "[]"))
+        List(a.length()) { a.getString(it) }
+    } catch (e: Exception) { emptyList() }
+
+    fun addLink(ctx: Context, url: String) {
+        val list = (listOf(url) + links(ctx).filter { it != url }).take(50)
+        sp(ctx).edit().putString("links", JSONArray(list).toString()).apply()
+    }
+
+    fun removeLink(ctx: Context, url: String) =
+        sp(ctx).edit().putString("links", JSONArray(links(ctx).filter { it != url }).toString()).apply()
 
     /** Cached copy of the TV's play history (last 30 days), keyed by [Media.key], newest first. */
     fun history(ctx: Context): LinkedHashMap<String, Progress> {

@@ -186,7 +186,7 @@ class MainActivity : AppCompatActivity() {
         menu.setOnMenuItemClickListener {
             when (it.itemId) {
                 1 -> askLink()
-                2 -> RadioPicker(this) { url, name, logo -> sendOnline { tv -> TvClient.radio(tv, url, name, logo) } }.show()
+                2 -> RadioPicker(this) { url, name, logo -> sendOnline { tv -> TvClient.radio(tv, url, name, logo, Prefs.vpn(this)) } }.show()
                 3 -> lifecycleScope.launch {
                     val tv = connectTv() ?: return@launch
                     if (!startSharing()) return@launch
@@ -206,10 +206,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Online link in private mode: the URL is sent straight to the TV and not kept anywhere
-     * (no history, no recent-links list, no copy in this app's storage).
+     * Online link. The TV keeps nothing about it; played links are remembered only on this phone
+     * (tap to replay, long-press to remove, Clear history removes all).
      */
     private fun askLink() {
+        val dp = resources.displayMetrics.density
         val input = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
             imeOptions = android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
@@ -219,23 +220,98 @@ class MainActivity : AppCompatActivity() {
         val clip = (getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager).primaryClip
             ?.getItemAt(0)?.text?.toString()?.trim()
         if (clip != null && (clip.startsWith("http://") || clip.startsWith("https://"))) input.setText(clip)
-        val box = android.widget.FrameLayout(this).apply {
-            val p = (20 * resources.displayMetrics.density).toInt()
+        val vpn = android.widget.CheckBox(this).apply {
+            text = "Use built-in VPN (ads & trackers are always blocked)"
+            isChecked = Prefs.vpn(this@MainActivity)
+            setOnCheckedChangeListener { _, on -> Prefs.setVpn(this@MainActivity, on) }
+        }
+        val links = Prefs.links(this).toMutableList()
+        val adapter = android.widget.ArrayAdapter(this, android.R.layout.simple_list_item_1, links.map { linkLabel(it) }.toMutableList())
+        val list = android.widget.ListView(this).apply {
+            this.adapter = adapter
+            layoutParams = android.widget.LinearLayout.LayoutParams(-1, if (links.isEmpty()) 0 else (minOf(links.size, 4) * 64 * dp).toInt())
+        }
+        val box = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            val p = (20 * dp).toInt()
             setPadding(p, 0, p, 0)
             addView(input)
+            addView(vpn)
+            if (links.isNotEmpty()) addView(TextView(this@MainActivity).apply {
+                text = "Saved links (tap to play, hold to remove)"
+                setPadding(0, (12 * dp).toInt(), 0, (4 * dp).toInt())
+            })
+            addView(list)
         }
-        AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setTitle("Play a link on the TV")
-            .setMessage("Video or stream link (mp4, m3u8 …), a web page with a video, a YouTube link, or a Google Photos shared-album link (starts a slideshow).\n\nPrivate: the link isn't saved on the phone or the TV. Ads/trackers are blocked; if a VPN app is running on the TV, it's used.")
+            .setMessage("Video or stream link (mp4, m3u8 …), a web page with a video, a YouTube link, or a Google Photos shared-album link (slideshow). Links are saved only on this phone; the TV keeps nothing.")
             .setView(box)
-            .setPositiveButton("Play") { _, _ ->
-                val url = input.text.toString().trim()
-                val u = Uri.parse(url)
-                if ((u.scheme != "http" && u.scheme != "https") || u.host.isNullOrBlank()) toast("Enter a link starting with http:// or https://")
-                else sendOnline { tv -> TvClient.url(tv, url) }
+            .setPositiveButton("Play") { _, _ -> playLink(input.text.toString().trim(), vpn.isChecked) }
+            .setNeutralButton("VPN server") { _, _ -> vpnSettings() }
+            .setNegativeButton("Cancel", null)
+            .show()
+        list.setOnItemClickListener { _, _, pos, _ ->
+            dialog.dismiss()
+            playLink(links[pos], vpn.isChecked)
+        }
+        list.setOnItemLongClickListener { _, _, pos, _ ->
+            Prefs.removeLink(this, links.removeAt(pos))
+            adapter.remove(adapter.getItem(pos))
+            true
+        }
+    }
+
+    private fun linkLabel(url: String): String {
+        val u = Uri.parse(url)
+        val name = u.lastPathSegment?.takeIf { it.length in 3..60 } ?: ""
+        return "${u.host.orEmpty()}${if (name.isNotEmpty()) " · $name" else ""}\n$url"
+    }
+
+    private fun playLink(url: String, vpn: Boolean) {
+        val u = Uri.parse(url)
+        if ((u.scheme != "http" && u.scheme != "https") || u.host.isNullOrBlank()) {
+            toast("Enter a link starting with http:// or https://")
+            return
+        }
+        sendOnline { tv -> TvClient.url(tv, url, vpn).also { if (it) Prefs.addLink(this, url) } }
+    }
+
+    private fun vpnSettings() {
+        val options = arrayOf("Cloudflare WARP (free, automatic)", "My WireGuard config (paste)…")
+        AlertDialog.Builder(this)
+            .setTitle("Built-in VPN server")
+            .setItems(options) { _, which ->
+                if (which == 0) sendVpn("") else {
+                    val input = EditText(this).apply {
+                        hint = "[Interface]\nPrivateKey = …\n\n[Peer]\n…"
+                        minLines = 6
+                        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                        imeOptions = android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+                        importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+                        val clip = (getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager).primaryClip
+                            ?.getItemAt(0)?.text?.toString()
+                        if (clip != null && clip.contains("[Interface]")) setText(clip)
+                    }
+                    AlertDialog.Builder(this)
+                        .setTitle("WireGuard config")
+                        .setMessage("Paste a WireGuard config from your VPN provider (e.g. Proton VPN free → WireGuard configuration). It's sent encrypted and stored only on the TV.")
+                        .setView(input)
+                        .setPositiveButton("Use") { _, _ -> sendVpn(input.text.toString()) }
+                        .setNegativeButton("Cancel", null)
+                        .show()
+                }
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    private fun sendVpn(config: String) {
+        lifecycleScope.launch {
+            val tv = connectTv() ?: return@launch
+            val name = withContext(Dispatchers.IO) { TvClient.vpnConfig(tv, config) }
+            toast(if (name != null) "TV VPN: $name" else "The TV didn't accept that config")
+        }
     }
 
     private fun sendOnline(send: (Tv) -> Boolean) {
@@ -616,8 +692,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun confirmClear() {
         AlertDialog.Builder(this)
-            .setTitle("Clear history & cache?")
-            .setMessage("Forgets all resume positions (on the phone and the TV) and deletes cached thumbnails. History older than 30 days is removed automatically anyway.")
+            .setTitle("Clear history, saved links & cache?")
+            .setMessage("Forgets all resume positions (on the phone and the TV), deletes the saved links list and cached thumbnails. History older than 30 days is removed automatically anyway.")
             .setPositiveButton("Clear") { _, _ ->
                 lifecycleScope.launch {
                     Prefs.clearHistory(this@MainActivity)
