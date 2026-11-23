@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="guide_shortcut_label">TV Cast shortcut</string>
+    <string name="guide_shortcut_desc">Press the Guide button twice quickly to open TV Cast. Only that button is watched; nothing on screen is read.</string>
+</resources>

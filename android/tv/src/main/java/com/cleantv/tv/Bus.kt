@@ -21,7 +21,13 @@ sealed class CastRequest {
         constructor(url: String, title: String, sub: String?, key: String, startMs: Long) :
             this(listOf(VideoItem(url, title, sub, key)), 0, startMs)
     }
-    data class Images(val urls: List<String>, val names: List<String>, val index: Int, val slideshow: Boolean = false) : CastRequest()
+    data class Images(
+        val urls: List<String>, val names: List<String>, val index: Int, val slideshow: Boolean = false,
+        /** Google Photos album: items may be videos (checked one by one as the slideshow reaches them). */
+        val albumVideos: Boolean = false,
+    ) : CastRequest()
+    /** Player screen asks for the one-time VPN permission, then runs [Bus.vpnRetry]. */
+    object VpnConsent : CastRequest()
 }
 
 interface CastController {
@@ -38,5 +44,7 @@ object Bus {
     @Volatile var onPhoneChanged: (() -> Unit)? = null
     @Volatile var onPaired: (() -> Unit)? = null
     @Volatile var onPairRequest: (() -> Unit)? = null
+    /** Re-runs the link/radio request after the VPN permission prompt (argument: VPN allowed). */
+    @Volatile var vpnRetry: ((Boolean) -> Unit)? = null
     val main = Handler(Looper.getMainLooper())
 }

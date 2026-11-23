@@ -29,6 +29,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import kotlin.coroutines.resume
 
 class MainActivity : AppCompatActivity() {
@@ -50,6 +51,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var videoFilter: Filter
     private lateinit var imageFilter: Filter
     private var shown = emptyList<Media>()
+    /** null = home (tiles + 3 recent items); "videos" / "pictures" / "recent" = a full page. */
+    private var page: String? = null
 
     private var filter: Filter
         get() = if (tab == TAB_PICTURES) imageFilter else videoFilter
@@ -114,10 +117,20 @@ class MainActivity : AppCompatActivity() {
             if (Prefs.lastTv(this)?.paired != true) toast("Select a TV first")
             else startActivity(Intent(this, RemoteActivity::class.java))
         }
-        findViewById<Button>(R.id.btnClear).apply {
-            contentDescription = "More"
-            (this as? com.google.android.material.button.MaterialButton)?.setIconResource(android.R.drawable.ic_menu_more)
-            setOnClickListener { moreMenu(it) }
+        findViewById<Button>(R.id.btnClear).setOnClickListener { confirmClear() }
+        findViewById<Button>(R.id.actVideos).setOnClickListener { openPage("videos") }
+        findViewById<Button>(R.id.actPictures).setOnClickListener { openPage("pictures") }
+        findViewById<Button>(R.id.actRecent).setOnClickListener { openPage("recent") }
+        findViewById<Button>(R.id.btnSeeAll).setOnClickListener { openPage("recent") }
+        findViewById<Button>(R.id.btnBack).setOnClickListener { finish() }
+        findViewById<Button>(R.id.actLink).setOnClickListener { askLink() }
+        findViewById<Button>(R.id.actRadio).setOnClickListener { startActivity(Intent(this, RadioActivity::class.java)) }
+        findViewById<Button>(R.id.actShowOnTv).setOnClickListener { showOnTv() }
+        findViewById<Button>(R.id.actApks).setOnClickListener { showApks() }
+        findViewById<Button>(R.id.actVpn).setOnClickListener { vpnPanel() }
+        findViewById<Button>(R.id.actRemote).setOnClickListener {
+            if (Prefs.lastTv(this)?.paired != true) toast("Select a TV first")
+            else startActivity(Intent(this, RemoteActivity::class.java))
         }
 
         videoFilter = Filter.load(this, "videos")
@@ -140,8 +153,20 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
+        page = intent.getStringExtra(EXTRA_PAGE)
+        tab = when (page) { "videos" -> TAB_VIDEOS; "pictures" -> TAB_PICTURES; else -> TAB_RECENT }
+        val home = page == null
+        tabs.visibility = View.GONE
+        findViewById<View>(R.id.tiles).visibility = if (home) View.VISIBLE else View.GONE
+        findViewById<View>(R.id.pageBar).visibility = if (home) View.GONE else View.VISIBLE
+        findViewById<TextView>(R.id.pageTitle).text = when (page) { "videos" -> "Videos"; "pictures" -> "Pictures"; else -> "History" }
+        search.visibility = if (home) View.GONE else View.VISIBLE
+        findViewById<View>(R.id.chips).visibility = if (home) View.GONE else View.VISIBLE
+
         if (hasMediaPermission()) maybeAskAllFilesAccess() else permLauncher.launch(mediaPermissions)
     }
+
+    private fun openPage(p: String) = startActivity(Intent(this, MainActivity::class.java).putExtra(EXTRA_PAGE, p))
 
     override fun onStart() {
         super.onStart()
@@ -158,6 +183,7 @@ class MainActivity : AppCompatActivity() {
         updateTvLabel()
         if (hasMediaPermission()) loadMedia()
         refreshHistory()
+        refreshVpnTile()
     }
 
     /** Reconnects to the TV (following IP changes) and pulls resume positions. No sharing is started. */
@@ -173,36 +199,82 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ------------------------------------------------------------ More menu
+    // ------------------------------------------------------------ home actions
 
-    private fun moreMenu(anchor: View) {
-        val menu = android.widget.PopupMenu(this, anchor)
-        menu.menu.add(0, 1, 0, "Play a link (video / stream / Google Photos)")
-        menu.menu.add(0, 2, 1, "Internet radio (FM stations)")
-        menu.menu.add(0, 3, 2, "Show on TV: browse phone from the TV")
-        menu.menu.add(0, 4, 3, "APK files on this phone")
-        menu.menu.add(0, 5, 4, "Disconnect from TV")
-        menu.menu.add(0, 6, 5, "Clear history")
-        menu.setOnMenuItemClickListener {
-            when (it.itemId) {
-                1 -> askLink()
-                2 -> RadioPicker(this) { url, name, logo -> sendOnline { tv -> TvClient.radio(tv, url, name, logo, Prefs.vpn(this)) } }.show()
-                3 -> lifecycleScope.launch {
-                    val tv = connectTv() ?: return@launch
-                    if (!startSharing()) return@launch
-                    val ok = withContext(Dispatchers.IO) {
-                        val ip = Net.localIpFor(tv.ip) ?: return@withContext false
-                        TvClient.hello(tv, "http://$ip:${MediaServer.PORT}/${Prefs.token(this@MainActivity)}", TvClient.phoneName(this@MainActivity))
-                    }
-                    toast(if (ok) "Open TV Cast on the TV to browse this phone" else "TV not reachable")
-                }
-                4 -> showApks()
-                5 -> disconnect()
-                6 -> confirmClear()
-            }
-            true
+    /** VPN tile: shows whether the TV's built-in VPN is on, with Start / Stop / server choice. */
+    private fun vpnPanel() {
+        lifecycleScope.launch {
+            val tv = connectTv() ?: return@launch
+            val s = withContext(Dispatchers.IO) { TvClient.vpnState(tv) }
+            if (s == null) { toast("Could not reach ${tv.name}"); return@launch }
+            showVpnState(s)
+            val on = s.optBoolean("up")
+            val msg = (if (on) "Connected via ${s.optString("provider")}." else "Not connected.") +
+                "\n\nUsed for links and radio (\"Use built-in VPN\" in Play link, now ${if (Prefs.vpn(this@MainActivity)) "on" else "off"}). " +
+                "Started here, it stays on until you stop it; otherwise it closes with the player." +
+                s.optString("error").takeIf { it.isNotBlank() }?.let { "\n\nLast error: $it" }.orEmpty()
+            AlertDialog.Builder(this@MainActivity)
+                .setTitle(if (on) "TV VPN: connected" else "TV VPN: off")
+                .setMessage(msg)
+                .setPositiveButton(if (on) "Stop VPN" else "Start VPN") { _, _ -> vpnSwitch(tv, !on) }
+                .setNeutralButton("Server") { _, _ -> vpnSettings() }
+                .setNegativeButton("Close", null)
+                .show()
         }
-        menu.show()
+    }
+
+    private fun vpnSwitch(tv: Tv, start: Boolean) {
+        lifecycleScope.launch {
+            val first = withContext(Dispatchers.IO) { if (start) TvClient.vpnStart(tv) else TvClient.vpnStop(tv) }
+            if (first == null) { toast("Could not reach ${tv.name}"); return@launch }
+            if (start && !first.optBoolean("permitted")) toast("On the TV, choose OK on the VPN prompt (one time)")
+            else toast(if (start) "Connecting VPN…" else "VPN stopped")
+            // Poll until the tunnel changes state (connecting can take a few seconds).
+            repeat(20) {
+                kotlinx.coroutines.delay(1500)
+                val s = withContext(Dispatchers.IO) { TvClient.vpnState(tv) } ?: return@repeat
+                showVpnState(s)
+                if (s.optBoolean("up") == start) {
+                    toast(if (start) "TV VPN connected (${s.optString("provider")})" else "TV VPN off")
+                    return@launch
+                }
+                if (start && s.optString("error").isNotBlank() && s.optBoolean("permitted")) {
+                    toast("VPN couldn't connect: ${s.optString("error")}")
+                    return@launch
+                }
+            }
+        }
+    }
+
+    private var vpnTileTint: android.content.res.ColorStateList? = null
+
+    private fun showVpnState(s: JSONObject?) {
+        val on = s?.optBoolean("up") == true
+        findViewById<com.google.android.material.button.MaterialButton>(R.id.actVpn).apply {
+            if (vpnTileTint == null) vpnTileTint = backgroundTintList
+            text = when { s == null -> "VPN"; on -> "VPN ON"; else -> "VPN off" }
+            // Highlighted green while the TV's VPN is connected.
+            backgroundTintList = if (on) android.content.res.ColorStateList.valueOf(0xFF1B8E3E.toInt()) else vpnTileTint
+            setTextColor(if (on) 0xFFFFFFFF.toInt() else getColor(R.color.text))
+            iconTint = android.content.res.ColorStateList.valueOf(if (on) 0xFFFFFFFF.toInt() else getColor(R.color.text))
+        }
+    }
+
+    private fun refreshVpnTile() {
+        val tv = Prefs.lastTv(this)?.takeIf { it.paired } ?: return
+        lifecycleScope.launch { showVpnState(withContext(Dispatchers.IO) { TvClient.vpnState(tv) }) }
+    }
+
+    private fun showOnTv() {
+        lifecycleScope.launch {
+            val tv = connectTv() ?: return@launch
+            if (!startSharing()) return@launch
+            val ok = withContext(Dispatchers.IO) {
+                val ip = Net.localIpFor(tv.ip) ?: return@withContext false
+                TvClient.hello(tv, "http://$ip:${MediaServer.PORT}/${Prefs.token(this@MainActivity)}", TvClient.phoneName(this@MainActivity))
+            }
+            toast(if (ok) "Open TV Cast on the TV to browse this phone" else "TV not reachable")
+        }
     }
 
     /**
@@ -216,6 +288,8 @@ class MainActivity : AppCompatActivity() {
             imeOptions = android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
             hint = "https://…"
             importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+            // A pasted-in clipboard link is replaced (not appended to) when typing.
+            setSelectAllOnFocus(true)
         }
         val clip = (getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager).primaryClip
             ?.getItemAt(0)?.text?.toString()?.trim()
@@ -272,6 +346,24 @@ class MainActivity : AppCompatActivity() {
         val u = Uri.parse(url)
         if ((u.scheme != "http" && u.scheme != "https") || u.host.isNullOrBlank()) {
             toast("Enter a link starting with http:// or https://")
+            return
+        }
+        if (AlbumLink.isAlbum(url)) {
+            // The TV has too little memory to load an album page; the phone reads it and sends the picture list.
+            lifecycleScope.launch {
+                val tv = connectTv() ?: return@launch
+                toast("Reading the album…")
+                val pics = withContext(Dispatchers.IO) { runCatching { AlbumLink.resolve(url) }.getOrDefault(emptyList()) }
+                if (pics.isEmpty()) { toast("No photos found. Is the album shared by link?"); return@launch }
+                val ok = withContext(Dispatchers.IO) {
+                    TvClient.images(tv, pics, List(pics.size) { "Item ${it + 1}" }, 0, slideshow = true)
+                }
+                if (ok) {
+                    Prefs.addLink(this@MainActivity, url)
+                    toast("${pics.size} items · slideshow on the TV")
+                    startActivity(Intent(this@MainActivity, RemoteActivity::class.java))
+                } else toast("Could not reach ${tv.name}")
+            }
             return
         }
         sendOnline { tv -> TvClient.url(tv, url, vpn).also { if (it) Prefs.addLink(this, url) } }
@@ -423,9 +515,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun render() {
         if (!::videoFilter.isInitialized) return
-        val items = currentItems
+        val items = if (page == null) currentItems.take(3) else currentItems
         shown = items
-        val span = if (tab == TAB_PICTURES) 3 else 2
+        val span = if (tab == TAB_PICTURES || page == null) 3 else 2
         (list.layoutManager as GridLayoutManager).spanCount = span
         adapter.submit(items, span, history)
         updateChips(items.size)
@@ -715,6 +807,7 @@ class MainActivity : AppCompatActivity() {
         private const val TAB_RECENT = 0
         private const val TAB_VIDEOS = 1
         private const val TAB_PICTURES = 2
+        const val EXTRA_PAGE = "page"
         private const val MAX_QUEUE = 300
     }
 }

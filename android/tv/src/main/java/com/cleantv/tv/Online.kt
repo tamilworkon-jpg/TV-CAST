@@ -18,18 +18,35 @@ import java.net.URL
 object Online {
     private const val MAX_PAGE = 3 * 1024 * 1024
 
-    /** Turns the built-in VPN on (or off when [vpn] is false). Returns false if it was wanted but failed. */
-    fun vpnReady(ctx: Context, vpn: Boolean): Boolean {
+    /**
+     * Brings the built-in VPN up (or down when [vpn] is false). Returns true when playback may go ahead.
+     *  - VPN permission missing → the player screen asks for it (Android only shows the prompt
+     *    to a visible screen of the app), then [retry] runs again; returns false for now.
+     *  - VPN fails to connect → not played (untick "Use built-in VPN" on the phone to play without it).
+     */
+    private fun vpnReady(ctx: Context, vpn: Boolean, retry: (Boolean) -> Unit): Boolean {
         if (!vpn) { Vpn.down(); return true }
         if (Vpn.up) return true
+        if (!Vpn.permitted(ctx)) {
+            Bus.vpnRetry = retry
+            play(ctx, CastRequest.VpnConsent)
+            return false
+        }
         toast(ctx, "Connecting VPN…")
         if (Vpn.ensureUp(ctx)) return true
-        toast(ctx, "${Vpn.error ?: "VPN failed"}. Not playing. Turn off \"Use VPN\" on the phone to play without it.")
+        toast(ctx, "${Vpn.error ?: "VPN failed"}. Not playing. Untick \"Use built-in VPN\" on the phone to play without it.")
         return false
     }
 
     fun radio(ctx: Context, item: VideoItem, vpn: Boolean) {
-        if (vpnReady(ctx, vpn)) play(ctx, CastRequest.Video(listOf(item), 0, 0))
+        if (vpnReady(ctx, vpn) { v -> radio(ctx, item, v) }) play(ctx, CastRequest.Video(listOf(item), 0, 0))
+    }
+
+    /** Google Photos album whose picture list the phone already read: slideshow, videos played in place. */
+    fun album(ctx: Context, urls: List<String>, names: List<String>, vpn: Boolean) {
+        if (vpnReady(ctx, vpn) { v -> album(ctx, urls, names, v) }) {
+            play(ctx, CastRequest.Images(urls, names, 0, slideshow = true, albumVideos = true))
+        }
     }
 
     fun open(ctx: Context, url: String, title: String, vpn: Boolean) {
@@ -38,7 +55,7 @@ object Online {
         try {
             when {
                 AdBlock.isBlocked(host) -> toast(ctx, "That link is an ad/tracker address and was blocked.")
-                !vpnReady(ctx, vpn) -> Unit
+                !vpnReady(ctx, vpn) { v -> open(ctx, url, title, v) } -> Unit
                 YouTube.isYouTube(host) -> {
                     toast(ctx, "Loading YouTube video…")
                     val item = runCatching { YouTube.resolve(url) }.getOrNull()
@@ -52,7 +69,7 @@ object Online {
                     toast(ctx, "Loading Google Photos album…")
                     val pics = GooglePhotos.resolve(url)
                     if (pics.isEmpty()) toast(ctx, "No pictures found. Is the album shared by link?")
-                    else play(ctx, CastRequest.Images(pics, List(pics.size) { "Photo ${it + 1}" }, 0, slideshow = true))
+                    else play(ctx, CastRequest.Images(pics, List(pics.size) { "Item ${it + 1}" }, 0, slideshow = true, albumVideos = true))
                 }
                 else -> {
                     val target = findPlayable(url) ?: run {
@@ -64,6 +81,7 @@ object Online {
                 }
             }
         } catch (e: Exception) {
+            android.util.Log.w("TvCast", "link failed: ${e.javaClass.simpleName}")
             toast(ctx, "Couldn't open that link.")
         }
     }
@@ -156,19 +174,59 @@ object GooglePhotos {
         c.connectTimeout = 8000
         c.readTimeout = 15_000
         c.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36")
+        // Skips Google's "Before you continue" consent page, which some VPN exit countries get instead of the album.
+        c.setRequestProperty("Cookie", "CONSENT=YES+cb; SOCS=CAI")
+        c.setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+        val started = System.currentTimeMillis()
         val html = try {
             // goo.gl short links go through one or two redirects to photos.google.com/share/...
             val host = c.url.host.lowercase()
             if (!host.endsWith("google.com") && !host.endsWith("goo.gl")) return emptyList()
-            c.inputStream.bufferedReader().use { it.readText() }
+            // Read at most 8 MB of the page (the TV has little memory).
+            c.inputStream.use { s ->
+                val buf = java.io.ByteArrayOutputStream()
+                val chunk = ByteArray(64 * 1024)
+                while (buf.size() < MAX_PAGE) {
+                    val n = s.read(chunk)
+                    if (n < 0) break
+                    buf.write(chunk, 0, n)
+                }
+                buf.toString("UTF-8")
+            }
         } finally {
             c.disconnect()
         }
-        if (!c.url.host.lowercase().endsWith("photos.google.com")) return emptyList()
+        val finalHost = c.url.host.lowercase()
         // Shared-album photos are served from lh3.googleusercontent.com/pw/<id>.
         val re = Regex("""https://lh3\.googleusercontent\.com/pw/[A-Za-z0-9_\-]{40,}""")
-        return re.findAll(html).map { it.value }.distinct()
-            .map { "$it=w1920-h1080" }
-            .toList()
+        val items = if (finalHost.endsWith("photos.google.com")) {
+            re.findAll(html).map { it.value }.distinct().take(MAX_PHOTOS).map { "$it=w1920-h1080" }.toList()
+        } else emptyList()
+        // Diagnostics only: no link or album id is logged.
+        android.util.Log.i("TvCast", "album: host=$finalHost page=${html.length / 1024}KB items=${items.size} in ${System.currentTimeMillis() - started}ms")
+        return items
     }
+
+    /**
+     * Google Photos serves an album item's video at "<item>=dv". For photos that address isn't a video,
+     * so a 1-byte request tells the two apart. Returns the video URL, or null for a photo.
+     */
+    fun videoUrl(item: String): String? {
+        val dv = item.substringBeforeLast('=') + "=dv"
+        val c = URL(dv).openConnection() as HttpURLConnection
+        return try {
+            c.instanceFollowRedirects = true
+            c.connectTimeout = 6000
+            c.readTimeout = 6000
+            c.setRequestProperty("Range", "bytes=0-0")
+            if (c.responseCode in 200..299 && c.contentType.orEmpty().lowercase().startsWith("video/")) dv else null
+        } catch (e: Exception) {
+            null
+        } finally {
+            c.disconnect()
+        }.also { android.util.Log.i("TvCast", "album item: ${if (it != null) "video" else "photo"}") }
+    }
+
+    private const val MAX_PAGE = 8 * 1024 * 1024
+    private const val MAX_PHOTOS = 500
 }

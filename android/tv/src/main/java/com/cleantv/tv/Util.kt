@@ -19,9 +19,15 @@ fun externalPlayers(ctx: Context): List<Pair<String, String>> {
 
 private var loader: ImageLoader? = null
 
-/** Pictures are streamed from the phone each time; nothing is written to the TV's small disk. */
+/**
+ * Pictures are streamed from the phone each time; nothing is written to the TV's small disk.
+ * The TV has only 1 GB of RAM, so only a few decoded pictures are kept in memory.
+ */
 fun imageLoader(ctx: Context): ImageLoader = loader ?: ImageLoader.Builder(ctx.applicationContext)
     .diskCache(null)
-    .memoryCache { MemoryCache.Builder(ctx.applicationContext).maxSizePercent(0.15).build() }
+    .memoryCache { MemoryCache.Builder(ctx.applicationContext).maxSizePercent(0.08).build() }
     .build()
     .also { loader = it }
+
+/** Frees decoded pictures when Android says memory is low. */
+fun trimImages() { loader?.memoryCache?.clear() }

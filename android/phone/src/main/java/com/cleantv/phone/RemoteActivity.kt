@@ -106,8 +106,8 @@ class RemoteActivity : AppCompatActivity() {
             finish()
         }
         queueRow = findViewById(R.id.queueRow)
-        findViewById<Button>(R.id.btnPrevVideo).setOnClickListener { send("prev") }
-        findViewById<Button>(R.id.btnNextVideo).setOnClickListener { send("next") }
+        findViewById<Button>(R.id.btnPrevVideo).setOnClickListener { if (isRadio()) stepStation(-1) else send("prev") }
+        findViewById<Button>(R.id.btnNextVideo).setOnClickListener { if (isRadio()) stepStation(1) else send("next") }
         btnPicMode = findViewById(R.id.btnPicMode)
         btnSoundMode = findViewById(R.id.btnSoundMode)
         btnPicMode.setOnClickListener { pickMode("Picture mode", "picModes", "picMode", "picmode") { customPicture() } }
@@ -142,6 +142,18 @@ class RemoteActivity : AppCompatActivity() {
     override fun onStop() {
         ServerService.uiVisible = (ServerService.uiVisible - 1).coerceAtLeast(0)
         super.onStop()
+    }
+
+    private fun isRadio() = last?.optBoolean("radio") == true && RadioQueue.stations.size > 1
+
+    /** Next/previous station from the list the station was picked from. */
+    private fun stepStation(delta: Int) {
+        val s = RadioQueue.step(delta) ?: return
+        Toast.makeText(this, s.name, Toast.LENGTH_SHORT).show()
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) { TvClient.radio(tv, s.url, s.name, s.logo, Prefs.vpn(this@RemoteActivity)) }
+            poll()
+        }
     }
 
     private fun send(cmd: String, v: String? = null) {
@@ -326,7 +338,10 @@ class RemoteActivity : AppCompatActivity() {
                     q > 1 -> "  ·  ${s.optInt("qIndex") + 1} of $q"
                     else -> ""
                 }
-                queueRow.visibility = if (q > 1) View.VISIBLE else View.GONE
+                val radioList = s.optBoolean("radio") && RadioQueue.stations.size > 1
+                queueRow.visibility = if (q > 1 || radioList) View.VISIBLE else View.GONE
+                findViewById<Button>(R.id.btnPrevVideo).text = if (radioList) "⏮ Previous station" else "⏮ Previous"
+                findViewById<Button>(R.id.btnNextVideo).text = if (radioList) "Next station ⏭" else "Next ⏭"
                 btnPicMode.text = "Picture: ${s.optString("picMode", "Standard")}"
                 btnSoundMode.text = "Sound: ${s.optString("soundMode", "Standard")}"
                 findViewById<View>(R.id.btnExternal).visibility = if (online) View.GONE else View.VISIBLE

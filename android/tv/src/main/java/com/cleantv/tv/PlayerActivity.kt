@@ -58,6 +58,8 @@ class PlayerActivity : AppCompatActivity(), CastController {
     private var ticks = 0
     private var cachedPlayers: List<Pair<String, String>> = emptyList()
     private var reconnecting = false
+    /** The Android VPN permission prompt is open over this screen. */
+    private var awaitingVpn = false
     private var queue: MutableList<VideoItem> = mutableListOf()
     private var rotation = 0
     private var zoom = 1f
@@ -78,11 +80,19 @@ class PlayerActivity : AppCompatActivity(), CastController {
     }
     private val slideStep = object : Runnable {
         override fun run() {
-            if (!slideshow) return
+            // While an album video plays, the slideshow waits; it resumes when the video ends.
+            if (!slideshow || slideVideo) return
             showImage(index + 1)
             handler.postDelayed(this, SLIDE_MS)
         }
     }
+
+    /** Google Photos album: each item is checked for a video when it comes up. */
+    private var albumVideos = false
+    /** An album video is playing in place of the current slide. */
+    private var slideVideo = false
+    /** Ignores video checks that finish after the slideshow has moved on. */
+    private var videoCheck = 0
     private val hideCaption = Runnable { caption.visibility = View.GONE }
     private val closeIfEnded = Runnable { if (player?.playbackState == Player.STATE_ENDED) finish() }
 
@@ -129,7 +139,46 @@ class PlayerActivity : AppCompatActivity(), CastController {
         when (r) {
             is CastRequest.Video -> playVideo(r)
             is CastRequest.Images -> showImages(r)
+            is CastRequest.VpnConsent -> askVpn()
             null -> if (mode == "idle") finish()
+        }
+    }
+
+    /** Shows Android's one-time VPN prompt (only allowed from a visible screen), then retries the link. */
+    private fun askVpn() {
+        val consent = android.net.VpnService.prepare(this)
+        if (consent == null) { vpnAnswered(true); return }
+        awaitingVpn = true
+        showCaption("Allow the TV Cast VPN (one time) with the remote → OK", 20_000)
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(consent, REQ_VPN)
+        } catch (e: Exception) {
+            awaitingVpn = false
+            vpnAnswered(false)
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_VPN) return
+        awaitingVpn = false
+        vpnAnswered(resultCode == RESULT_OK)
+    }
+
+    private fun vpnAnswered(allowed: Boolean) {
+        val retry = Bus.vpnRetry
+        Bus.vpnRetry = null
+        if (allowed && retry != null) {
+            showCaption("Connecting VPN…", 10_000)
+            Thread { retry(true) }.start()
+            // Opened only for the prompt (e.g. VPN started from the phone): close once nothing else is shown.
+            if (mode == "idle") handler.postDelayed({ if (mode == "idle") finish() }, 6000)
+        } else if (!allowed) {
+            showCaption("VPN not allowed, so the link wasn't played.\nUntick \"Use built-in VPN\" on the phone to play without it.", 10_000)
+            if (mode == "idle") handler.postDelayed({ if (mode == "idle") finish() }, 10_000)
         }
     }
 
@@ -331,6 +380,14 @@ class PlayerActivity : AppCompatActivity(), CastController {
             .setLoadErrorHandlingPolicy(androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy(10))
         val p = ExoPlayer.Builder(this, renderers)
             .setMediaSourceFactory(sources)
+            // Default buffering can take ~130 MB, too much for this 1 GB TV: cap it at 40 MB / 40 s.
+            .setLoadControl(
+                androidx.media3.exoplayer.DefaultLoadControl.Builder()
+                    .setBufferDurationsMs(15_000, 40_000, 2_500, 5_000)
+                    .setTargetBufferBytes(40 * 1024 * 1024)
+                    .setPrioritizeTimeOverSizeThresholds(false)
+                    .build()
+            )
             .setAudioAttributes(AudioAttributes.DEFAULT, true)
             .setSeekBackIncrementMs(10_000)
             .setSeekForwardIncrementMs(10_000)
@@ -341,6 +398,12 @@ class PlayerActivity : AppCompatActivity(), CastController {
             .build()
         p.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
+                if (mode == "images") {
+                    // Album video that can't be played: carry on with the slideshow.
+                    showCaption("Couldn't play this video, skipping", 3000)
+                    endSlideVideo(advance = true)
+                    return
+                }
                 val online = current?.online == true
                 // 2xxx = network/IO errors: the file is fine, the connection isn't. Reconnect automatically.
                 if (error.errorCode in 2000..2999 && mode == "video" && !online) {
@@ -379,6 +442,10 @@ class PlayerActivity : AppCompatActivity(), CastController {
                 if (state == Player.STATE_READY && reconnecting) {
                     reconnecting = false
                     handler.removeCallbacks(reconnectStep)
+                }
+                if (state == Player.STATE_ENDED && mode == "images") {
+                    endSlideVideo(advance = true)
+                    return
                 }
                 if (state == Player.STATE_ENDED) {
                     saveProgress()
@@ -753,10 +820,12 @@ class PlayerActivity : AppCompatActivity(), CastController {
 
     private fun showImages(r: CastRequest.Images) {
         releasePlayer()
+        slideVideo = false
         mode = "images"
         queue = mutableListOf()
         urls = r.urls
         names = r.names
+        albumVideos = r.albumVideos
         playerView.visibility = View.GONE
         image.visibility = View.VISIBLE
         image.scaleType = ImageView.ScaleType.FIT_CENTER
@@ -767,14 +836,56 @@ class PlayerActivity : AppCompatActivity(), CastController {
 
     private fun showImage(i: Int) {
         if (urls.isEmpty()) return
+        endSlideVideo(advance = false)
         index = ((i % urls.size) + urls.size) % urls.size
         resetView(apply = false)
         image.load(urls[index], imageLoader(this)) {
             crossfade(300)
+            // Never decode bigger than the TV screen (a 12 MP photo would otherwise take ~48 MB).
+            size(1920, 1080)
             listener(onSuccess = { _, _ -> applyTransform() })
         }
         applyTransform()
         showCaption("${names.getOrElse(index) { "" }}   (${index + 1}/${urls.size})   ·   ☰ rotate / zoom")
+        if (albumVideos) {
+            val token = ++videoCheck
+            val item = urls[index]
+            io.execute {
+                val video = GooglePhotos.videoUrl(item)
+                runOnUiThread {
+                    if (video != null && token == videoCheck && mode == "images" && !isFinishing) playSlideVideo(video)
+                }
+            }
+        }
+    }
+
+    /** Plays an album video full screen in place of its preview picture. */
+    private fun playSlideVideo(url: String) {
+        slideVideo = true
+        handler.removeCallbacks(slideStep)
+        val p = player ?: createPlayer()
+        image.visibility = View.GONE
+        playerView.visibility = View.VISIBLE
+        p.setMediaItem(MediaItem.fromUri(url))
+        p.prepare()
+        p.playWhenReady = true
+        showCaption("Video   (${index + 1}/${urls.size})   ·   OK to pause · ⏭ to skip", 4000)
+    }
+
+    /** Back to pictures after an album video; [advance] moves on to the next item. */
+    private fun endSlideVideo(advance: Boolean) {
+        if (!slideVideo) return
+        slideVideo = false
+        releasePlayer()
+        playerView.visibility = View.GONE
+        image.visibility = View.VISIBLE
+        if (advance) {
+            showImage(index + 1)
+            if (slideshow) {
+                handler.removeCallbacks(slideStep)
+                handler.postDelayed(slideStep, SLIDE_MS)
+            }
+        }
     }
 
     // ------------------------------------------------------ rotate / zoom
@@ -1012,7 +1123,11 @@ class PlayerActivity : AppCompatActivity(), CastController {
                     if (down) { stopSlideshow(); showImage(index + 1) }; true
                 }
                 KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
-                    if (down) toggleSlideshow(); true
+                    if (down) {
+                        val p = player
+                        if (slideVideo && p != null) p.playWhenReady = !p.playWhenReady else toggleSlideshow()
+                    }
+                    true
                 }
                 else -> false
             }
@@ -1039,10 +1154,15 @@ class PlayerActivity : AppCompatActivity(), CastController {
         return super.dispatchKeyEvent(event)
     }
 
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= TRIM_MEMORY_RUNNING_LOW) trimImages()
+    }
+
     override fun onStop() {
         super.onStop()
         // Home pressed or another app opened: stop playback instead of playing hidden.
-        if (!isFinishing) finish()
+        if (!isFinishing && !awaitingVpn) finish()
     }
 
     override fun onDestroy() {
@@ -1051,8 +1171,9 @@ class PlayerActivity : AppCompatActivity(), CastController {
         sayBye()
         io.shutdownNow()
         releasePlayer()
-        // Built-in VPN is only for online playback; close it with the player unless another link is starting.
-        if (Bus.pending == null) Vpn.downAsync()
+        // Built-in VPN is only for online playback; close it with the player unless another link is
+        // starting, it was started from the phone's VPN button, or this screen only asked for permission.
+        if (Bus.pending == null && !Vpn.keepOn && mode != "idle") Vpn.downAsync()
         if (Bus.controller === this) {
             Bus.controller = null
             Bus.status = Bus.IDLE
@@ -1068,6 +1189,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
 
     companion object {
         private const val SLIDE_MS = 5000L
+        private const val REQ_VPN = 41
         private const val RECONNECT_GIVE_UP_S = 15 * 60
         private val ZOOMS = listOf(1f, 1.25f, 1.5f, 2f, 2.5f, 3f)
         private val SPEEDS = listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 1.75f, 2f)

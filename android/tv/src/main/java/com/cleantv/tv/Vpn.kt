@@ -47,6 +47,9 @@ object Vpn {
     @Volatile var up = false
         private set
 
+    /** Started from the phone's VPN button: stays on until Stop, instead of closing with the player. */
+    @Volatile var keepOn = false
+
     /** Last error shown to the user, or null. */
     @Volatile var error: String? = null
         private set
@@ -68,26 +71,18 @@ object Vpn {
         return true
     }
 
-    /**
-     * Brings the tunnel up (blocking, call off the main thread). Asks for the one-time Android
-     * VPN permission on the TV if needed and waits up to 90 s for it.
-     */
+    /** True once the one-time Android VPN permission has been given (PlayerActivity asks for it). */
+    fun permitted(ctx: Context): Boolean = VpnService.prepare(ctx.applicationContext) == null
+
+    /** Brings the tunnel up (blocking, call off the main thread). Needs [permitted] first. */
     fun ensureUp(ctx: Context): Boolean = synchronized(lock) {
         error = null
         if (up) return true
         val app = ctx.applicationContext
         try {
-            VpnService.prepare(app)?.let { consent ->
-                Bus.main.post { android.widget.Toast.makeText(app, "Allow the TV Cast VPN (one time) with the remote", android.widget.Toast.LENGTH_LONG).show() }
-                app.startActivity(consent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                val until = System.currentTimeMillis() + 90_000
-                while (VpnService.prepare(app) != null) {
-                    if (System.currentTimeMillis() > until) {
-                        error = "VPN permission wasn't given on the TV"
-                        return false
-                    }
-                    Thread.sleep(700)
-                }
+            if (!permitted(app)) {
+                error = "VPN not allowed on the TV yet"
+                return false
             }
             val text = sp(app).getString("custom", null) ?: warpConfig(app)
             val config = Config.parse(ByteArrayInputStream(text.toByteArray()))

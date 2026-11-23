@@ -265,6 +265,11 @@ object TvClient {
         }
     }
 
+    /** TV's built-in VPN: {up, keepOn, permitted, provider, error}, or null if the TV can't be reached. */
+    fun vpnState(tv: Tv): JSONObject? = sget(tv, "/vpn/state", 2000)?.let { runCatching { JSONObject(it) }.getOrNull() }
+    fun vpnStart(tv: Tv): JSONObject? = spost(tv, "/vpn/start", "{}", 3000)?.let { runCatching { JSONObject(it) }.getOrNull() }
+    fun vpnStop(tv: Tv): JSONObject? = spost(tv, "/vpn/stop", "{}", 3000)?.let { runCatching { JSONObject(it) }.getOrNull() }
+
     fun control(tv: Tv, cmd: String, v: String? = null): Boolean =
         sget(tv, "/control?cmd=$cmd" + (v?.let { "&v=" + URLEncoder.encode(it, "UTF-8") } ?: "")) != null
 

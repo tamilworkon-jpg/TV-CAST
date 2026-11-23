@@ -79,6 +79,237 @@
             app:iconTint="@color/text2" />
     </LinearLayout>
 
+    <!-- Home: tiles; each opens its own page. -->
+    <LinearLayout
+        android:id="@+id/tiles"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:orientation="vertical"
+        android:paddingHorizontal="12dp">
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/actVideos"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="0dp"
+                android:layout_height="92dp"
+                android:layout_margin="4dp"
+                android:layout_weight="1"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:maxLines="1"
+                android:paddingHorizontal="4dp"
+                android:text="Videos"
+                android:textSize="13sp"
+                app:cornerRadius="18dp"
+                app:icon="@android:drawable/ic_media_play"
+                app:iconGravity="top"
+                app:iconPadding="8dp"
+                app:iconSize="28dp" />            <com.google.android.material.button.MaterialButton
+                android:id="@+id/actPictures"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="0dp"
+                android:layout_height="92dp"
+                android:layout_margin="4dp"
+                android:layout_weight="1"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:maxLines="1"
+                android:paddingHorizontal="4dp"
+                android:text="Pictures"
+                android:textSize="13sp"
+                app:cornerRadius="18dp"
+                app:icon="@android:drawable/ic_menu_gallery"
+                app:iconGravity="top"
+                app:iconPadding="8dp"
+                app:iconSize="28dp" />            <com.google.android.material.button.MaterialButton
+                android:id="@+id/actRadio"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="0dp"
+                android:layout_height="92dp"
+                android:layout_margin="4dp"
+                android:layout_weight="1"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:maxLines="1"
+                android:paddingHorizontal="4dp"
+                android:text="Radio"
+                android:textSize="13sp"
+                app:cornerRadius="18dp"
+                app:icon="@android:drawable/ic_lock_silent_mode_off"
+                app:iconGravity="top"
+                app:iconPadding="8dp"
+                app:iconSize="28dp" />        </LinearLayout>
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/actLink"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="0dp"
+                android:layout_height="92dp"
+                android:layout_margin="4dp"
+                android:layout_weight="1"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:maxLines="1"
+                android:paddingHorizontal="4dp"
+                android:text="Play link"
+                android:textSize="13sp"
+                app:cornerRadius="18dp"
+                app:icon="@android:drawable/ic_menu_send"
+                app:iconGravity="top"
+                app:iconPadding="8dp"
+                app:iconSize="28dp" />            <com.google.android.material.button.MaterialButton
+                android:id="@+id/actShowOnTv"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="0dp"
+                android:layout_height="92dp"
+                android:layout_margin="4dp"
+                android:layout_weight="1"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:maxLines="1"
+                android:paddingHorizontal="4dp"
+                android:text="Show on TV"
+                android:textSize="13sp"
+                app:cornerRadius="18dp"
+                app:icon="@drawable/ic_tv"
+                app:iconGravity="top"
+                app:iconPadding="8dp"
+                app:iconSize="28dp" />            <com.google.android.material.button.MaterialButton
+                android:id="@+id/actRemote"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="0dp"
+                android:layout_height="92dp"
+                android:layout_margin="4dp"
+                android:layout_weight="1"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:maxLines="1"
+                android:paddingHorizontal="4dp"
+                android:text="Remote"
+                android:textSize="13sp"
+                app:cornerRadius="18dp"
+                app:icon="@drawable/ic_play"
+                app:iconGravity="top"
+                app:iconPadding="8dp"
+                app:iconSize="28dp" />        </LinearLayout>
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/actVpn"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="0dp"
+                android:layout_height="92dp"
+                android:layout_margin="4dp"
+                android:layout_weight="1"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:maxLines="1"
+                android:paddingHorizontal="4dp"
+                android:text="VPN"
+                android:textSize="13sp"
+                app:cornerRadius="18dp"
+                app:icon="@android:drawable/ic_lock_lock"
+                app:iconGravity="top"
+                app:iconPadding="8dp"
+                app:iconSize="28dp" />            <com.google.android.material.button.MaterialButton
+                android:id="@+id/actApks"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="0dp"
+                android:layout_height="92dp"
+                android:layout_margin="4dp"
+                android:layout_weight="1"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:maxLines="1"
+                android:paddingHorizontal="4dp"
+                android:text="APK files"
+                android:textSize="13sp"
+                app:cornerRadius="18dp"
+                app:icon="@android:drawable/ic_menu_agenda"
+                app:iconGravity="top"
+                app:iconPadding="8dp"
+                app:iconSize="28dp" />            <com.google.android.material.button.MaterialButton
+                android:id="@+id/actRecent"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="0dp"
+                android:layout_height="92dp"
+                android:layout_margin="4dp"
+                android:layout_weight="1"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:maxLines="1"
+                android:paddingHorizontal="4dp"
+                android:text="History"
+                android:textSize="13sp"
+                app:cornerRadius="18dp"
+                app:icon="@android:drawable/ic_menu_recent_history"
+                app:iconGravity="top"
+                app:iconPadding="8dp"
+                app:iconSize="28dp" />        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingHorizontal="6dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Continue watching"
+                android:textColor="@color/text"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <Button
+                android:id="@+id/btnSeeAll"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="See all" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- Page (Videos / Pictures / History): back arrow + title. -->
+    <LinearLayout
+        android:id="@+id/pageBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingHorizontal="8dp"
+        android:visibility="gone">
+
+        <Button
+            android:id="@+id/btnBack"
+            style="@style/Widget.Material3.Button.IconButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:contentDescription="Back"
+            app:icon="@drawable/abc_ic_ab_back_material"
+            app:iconTint="@color/text" />
+
+        <TextView
+            android:id="@+id/pageTitle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="@color/text"
+            android:textSize="22sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
     <com.google.android.material.tabs.TabLayout
         android:id="@+id/tabs"
         android:layout_width="match_parent"
@@ -110,6 +341,7 @@
         android:textSize="14sp" />
 
     <HorizontalScrollView
+        android:id="@+id/chips"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:scrollbars="none">

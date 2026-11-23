@@ -147,8 +147,14 @@ class CastServer(private val ctx: Context) : NanoHTTPD(PORT) {
         "/images" -> {
             val j = JSONObject(body)
             val urls = j.getJSONArray("urls").strings().map { safeUrl(it) }
-            Bus.pending = CastRequest.Images(urls, j.optJSONArray("names")?.strings().orEmpty(), j.optInt("index"), j.optBoolean("slideshow"))
-            openPlayer()
+            val names = j.optJSONArray("names")?.strings().orEmpty()
+            if (urls.isNotEmpty() && urls.all { it.startsWith("https://lh3.googleusercontent.com/") }) {
+                // Google Photos album read by the phone: online pictures/videos, through the VPN like other links.
+                worker.execute { Online.album(ctx, urls, names, j.optBoolean("vpn", true)) }
+            } else {
+                Bus.pending = CastRequest.Images(urls, names, j.optInt("index"), j.optBoolean("slideshow"))
+                openPlayer()
+            }
             ok()
         }
         "/url" -> {
@@ -174,6 +180,23 @@ class CastServer(private val ctx: Context) : NanoHTTPD(PORT) {
                 worker.execute { Vpn.down() }
                 json(JSONObject().put("provider", Vpn.provider(ctx)).toString())
             }
+        }
+        "/vpn/state" -> json(vpnState())
+        "/vpn/start" -> {
+            if (Vpn.permitted(ctx)) {
+                worker.execute { Vpn.keepOn = Vpn.ensureUp(ctx) }
+            } else {
+                // Android shows its one-time VPN prompt only to a visible screen: the player asks, then we connect.
+                Bus.vpnRetry = { allowed -> if (allowed) Vpn.keepOn = Vpn.ensureUp(ctx) }
+                Bus.pending = CastRequest.VpnConsent
+                openPlayer()
+            }
+            json(vpnState())
+        }
+        "/vpn/stop" -> {
+            Vpn.keepOn = false
+            worker.execute { Vpn.down() }
+            json(vpnState())
         }
         "/control" -> {
             val cmd = s.parameters["cmd"]?.firstOrNull().orEmpty()
@@ -218,6 +241,10 @@ class CastServer(private val ctx: Context) : NanoHTTPD(PORT) {
     }
 
     private fun ok() = json("{\"ok\":true}")
+
+    private fun vpnState(): String = JSONObject()
+        .put("up", Vpn.up).put("keepOn", Vpn.keepOn).put("permitted", Vpn.permitted(ctx))
+        .put("provider", Vpn.provider(ctx)).put("error", Vpn.error ?: "").toString()
     private fun json(text: String) = newFixedLengthResponse(Response.Status.OK, "application/json", text)
     private fun status(st: Response.Status, msg: String) = newFixedLengthResponse(st, MIME_PLAINTEXT, msg)
 
