@@ -92,6 +92,11 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this, "History cleared", Toast.LENGTH_SHORT).show()
                     render()
                 }
+                .setNeutralButton("Forget paired phones") { _, _ ->
+                    val n = Auth.pairedNames(this).size
+                    Auth.forgetAll(this)
+                    Toast.makeText(this, "Forgot $n phone(s). They must pair again with a new code.", Toast.LENGTH_LONG).show()
+                }
                 .setNegativeButton("Cancel", null)
                 .show()
         }
@@ -189,11 +194,21 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         Bus.onPhoneChanged = { load() }
         load()
+        pinPoll.run()
     }
 
     override fun onPause() {
         Bus.onPhoneChanged = null
+        grid.removeCallbacks(pinPoll)
         super.onPause()
+    }
+
+    /** Shows a pairing code here when a phone asks to pair while TV Cast is open. */
+    private val pinPoll: Runnable = object : Runnable {
+        override fun run() {
+            PairDialog.showIfPending(this@MainActivity)
+            grid.postDelayed(this, 1000)
+        }
     }
 
     private fun selectTab(i: Int) {
@@ -220,7 +235,7 @@ class MainActivity : AppCompatActivity() {
                     offline = true
                     updateInfo()
                     if (videos.isEmpty() && images.isEmpty()) {
-                        showEmpty("Can't reach $phoneName.\nOpen TV Cast on the phone (same Wi-Fi), then press Refresh.")
+                        showEmpty("$phoneName isn't sharing right now.\nOpen TV Cast on the phone (same Wi-Fi), then press Refresh.")
                         return@runOnUiThread
                     }
                 } else {
@@ -319,7 +334,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun play(item: Item, startMs: Long) {
         val b = base ?: return
-        Bus.pending = CastRequest.Video("$b/v/${item.id}", item.name, item.sub?.let { "$b/s/${item.id}.$it" }, item.key, startMs)
+        // The whole visible list becomes the play queue, so Next/Previous work in the player.
+        val list = shown.filter { it.video }.take(MAX_QUEUE)
+        val idx = list.indexOf(item).coerceAtLeast(0)
+        val items = list.map { VideoItem("$b/v/${it.id}", it.name, it.sub?.let { s -> "$b/s/${it.id}.$s" }, it.key) }
+        Bus.pending = CastRequest.Video(items.ifEmpty {
+            listOf(VideoItem("$b/v/${item.id}", item.name, item.sub?.let { "$b/s/${item.id}.$it" }, item.key))
+        }, if (items.isEmpty()) 0 else idx, startMs)
         startActivity(Intent(this, PlayerActivity::class.java))
     }
 
@@ -400,5 +421,6 @@ class MainActivity : AppCompatActivity() {
         private const val TAB_VIDEOS = 1
         private const val TAB_PICTURES = 2
         private const val MOVIE_MS = 40 * 60 * 1000L
+        private const val MAX_QUEUE = 300
     }
 }

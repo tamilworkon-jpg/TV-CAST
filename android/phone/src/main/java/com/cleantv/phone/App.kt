@@ -13,6 +13,11 @@ import coil.key.Keyer
 import coil.request.Options
 
 class App : Application(), ImageLoaderFactory {
+    override fun onCreate() {
+        super.onCreate()
+        TvClient.app = this
+    }
+
     override fun newImageLoader(): ImageLoader = ImageLoader.Builder(this)
         .components {
             add(ThumbFetcher.Factory())

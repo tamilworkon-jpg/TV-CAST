@@ -11,21 +11,29 @@ import java.io.FileInputStream
 import android.os.ParcelFileDescriptor
 
 /** Serves phone media to the TV over HTTP with byte-range support (needed for seeking). */
-class MediaServer(private val ctx: Context, private val token: String) : NanoHTTPD(PORT) {
+class MediaServer(private val ctx: Context, private val token: String, private val onBye: () -> Unit) : NanoHTTPD(PORT) {
     @Volatile var lastHit = System.currentTimeMillis()
 
     override fun serve(session: IHTTPSession): Response {
-        lastHit = System.currentTimeMillis()
         val all = session.uri.trim('/').split('/')
         if (all.firstOrNull() == "ping") return newFixedLengthResponse("ok")
         // Every media URL starts with a per-install secret so other devices on the Wi-Fi can't browse the phone.
         if (all.firstOrNull() != token) return notFound()
+        // …and only the TV this phone is paired with may fetch anything.
+        val tvIp = Prefs.lastTv(ctx)?.ip
+        if (tvIp == null || session.remoteIpAddress != tvIp) return notFound()
+        lastHit = System.currentTimeMillis()
         val parts = all.drop(1)
         return try {
             val id = parts.getOrNull(1)?.substringBefore('.')?.toLongOrNull()
             when (parts.getOrNull(0)) {
                 "list" -> newFixedLengthResponse(Response.Status.OK, "application/json", MediaRepo.libraryJson(ctx))
                 "alive" -> newFixedLengthResponse("ok")
+                "bye" -> {
+                    lastHit = 0
+                    onBye()
+                    newFixedLengthResponse("ok")
+                }
                 "t" -> serveThumb(parts.getOrNull(1), parts.getOrNull(2)?.toLongOrNull())
                 "v" -> if (id == null) notFound() else serveUri(session, MediaRepo.videoUri(id))
                 "i" -> if (id == null) notFound() else serveUri(session, MediaRepo.imageUri(id))
@@ -33,7 +41,7 @@ class MediaServer(private val ctx: Context, private val token: String) : NanoHTT
                 else -> notFound()
             }
         } catch (e: Exception) {
-            newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, e.toString())
+            newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "error")
         }
     }
 

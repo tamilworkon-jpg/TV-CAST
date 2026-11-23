@@ -115,6 +115,34 @@
                     android:layout_margin="3dp" android:text="Screen: Fit" />
             </LinearLayout>
 
+            <LinearLayout
+                android:id="@+id/queueRow"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:visibility="gone">
+
+                <Button android:id="@+id/btnPrevVideo" style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:layout_margin="3dp" android:text="⏮ Previous" />
+                <Button android:id="@+id/btnNextVideo" style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:layout_margin="3dp" android:text="Next ⏭" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button android:id="@+id/btnPicMode" style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:layout_margin="3dp" android:text="Picture: Standard" />
+                <Button android:id="@+id/btnSoundMode" style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+                    android:layout_margin="3dp" android:text="Sound: Standard" />
+            </LinearLayout>
+
             <Button
                 android:id="@+id/btnExternal"
                 style="@style/Widget.Material3.Button.OutlinedButton"
@@ -243,5 +271,13 @@
             android:layout_marginTop="28dp"
             android:textColor="#FF6B6B"
             android:text="Stop on TV" />
+
+        <Button
+            android:id="@+id/btnDisconnect"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="@color/text2"
+            android:text="Disconnect (stop sharing from this phone)" />
     </LinearLayout>
 </ScrollView>

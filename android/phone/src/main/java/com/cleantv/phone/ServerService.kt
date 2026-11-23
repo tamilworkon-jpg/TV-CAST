@@ -49,16 +49,19 @@ class ServerService : Service() {
         )
         val notification = NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat)
-            .setContentTitle("TV Cast is sharing your media")
-            .setContentText("Stays on while the TV is using it · stops 1 hour after the TV closes")
+            .setContentTitle("TV Cast is sharing with your TV")
+            .setContentText("Only while you're playing · stops by itself 2 min after the TV is done")
             .setContentIntent(openPi)
-            .addAction(0, "Stop", stopPi)
+            .addAction(0, "Disconnect", stopPi)
             .setOngoing(true)
             .build()
         ServiceCompat.startForeground(this, 1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
 
         try {
-            server = MediaServer(this, Prefs.token(this)).also { it.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false) }
+            server = MediaServer(this, Prefs.token(this)) {
+                // TV closed the player: stop now unless the phone app is open.
+                handler.post { if (uiVisible == 0) stopSelf() }
+            }.also { it.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false) }
         } catch (e: Exception) {
             Log.e("TvCast", "server start failed", e)
         }
@@ -106,11 +109,14 @@ class ServerService : Service() {
 
     private val handler = Handler(Looper.getMainLooper())
 
-    /** Stops sharing (and frees the wake/Wi-Fi locks) once the TV hasn't fetched anything for a while. */
+    /**
+     * On-demand sharing: runs while TV Cast is open on the phone or the TV is using it
+     * (the TV player pings every 30 s), and stops 2 minutes after both end.
+     */
     private val idleCheck = object : Runnable {
         override fun run() {
             val last = maxOf(server?.lastHit ?: 0L, lastStart)
-            if (System.currentTimeMillis() - last > IDLE_LIMIT_MS) {
+            if (uiVisible == 0 && System.currentTimeMillis() - last > IDLE_LIMIT_MS) {
                 Log.i("TvCast", "idle, stopping server")
                 stopSelf()
             } else {
@@ -121,7 +127,11 @@ class ServerService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            stopSelf()
+            // "Disconnect" from the notification: tell the TV, then stop sharing.
+            scope.launch(Dispatchers.IO) {
+                Prefs.lastTv(this@ServerService)?.takeIf { it.paired }?.let { TvClient.bye(it) }
+            }
+            handler.postDelayed({ stopSelf() }, 300)
             return START_NOT_STICKY
         }
         lastStart = System.currentTimeMillis()
@@ -142,13 +152,25 @@ class ServerService : Service() {
     companion object {
         private const val CHANNEL = "server"
         private const val ACTION_STOP = "stop"
-        private const val IDLE_LIMIT_MS = 60 * 60 * 1000L
-        private const val IDLE_CHECK_MS = 60 * 1000L
+        private const val IDLE_LIMIT_MS = 2 * 60 * 1000L
+        private const val IDLE_CHECK_MS = 30 * 1000L
         @Volatile var running = false
         @Volatile private var lastStart = System.currentTimeMillis()
 
+        /** Number of TV Cast phone screens currently visible (sharing stays on while > 0). */
+        @Volatile var uiVisible = 0
+
         fun start(ctx: Context) {
             ContextCompat.startForegroundService(ctx, Intent(ctx, ServerService::class.java))
+        }
+
+        /** Disconnect button: tells the TV to close, then stops sharing. */
+        fun disconnect(ctx: Context) {
+            if (!running) {
+                Thread { Prefs.lastTv(ctx)?.takeIf { it.paired }?.let { TvClient.bye(it) } }.start()
+                return
+            }
+            ctx.startService(Intent(ctx, ServerService::class.java).setAction(ACTION_STOP))
         }
     }
 }

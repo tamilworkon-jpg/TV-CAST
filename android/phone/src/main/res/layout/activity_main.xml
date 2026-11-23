@@ -52,6 +52,15 @@
             app:iconTint="@color/text" />
 
         <Button
+            android:id="@+id/btnDisconnect"
+            style="@style/Widget.Material3.Button.IconButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:contentDescription="Disconnect from TV"
+            app:icon="@android:drawable/ic_menu_close_clear_cancel"
+            app:iconTint="#FF6B6B" />
+
+        <Button
             android:id="@+id/btnRemote"
             style="@style/Widget.Material3.Button.IconButton"
             android:layout_width="wrap_content"

@@ -52,6 +52,14 @@ object History {
     }
 
     @Synchronized
+    fun find(ctx: Context, key: String): JSONObject? {
+        if (key.isEmpty()) return null
+        val a = all(ctx)
+        for (i in 0 until a.length()) if (a.getJSONObject(i).optString("key") == key) return a.getJSONObject(i)
+        return null
+    }
+
+    @Synchronized
     fun clear(ctx: Context) {
         sp(ctx).edit().clear().apply()
     }

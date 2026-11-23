@@ -42,6 +42,8 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.recyclerview:recyclerview:1.3.2")
     implementation("androidx.media3:media3-exoplayer:1.3.1")
+    implementation("androidx.media3:media3-exoplayer-hls:1.3.1")
+    implementation("androidx.media3:media3-exoplayer-dash:1.3.1")
     implementation("androidx.media3:media3-ui:1.3.1")
     implementation("org.nanohttpd:nanohttpd:2.3.1")
     implementation("io.coil-kt:coil:2.6.0")

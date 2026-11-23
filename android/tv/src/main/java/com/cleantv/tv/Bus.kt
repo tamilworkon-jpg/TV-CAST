@@ -3,9 +3,23 @@ package com.cleantv.tv
 import android.os.Handler
 import android.os.Looper
 
+/** One entry of a video play queue. [online] = from the internet (ad-blocked, no resume history). */
+data class VideoItem(
+    val url: String,
+    val title: String,
+    val sub: String? = null,
+    val key: String = "",
+    val online: Boolean = false,
+    val radio: Boolean = false,
+    val artwork: String? = null,
+)
+
 sealed class CastRequest {
-    data class Video(val url: String, val title: String, val sub: String?, val key: String, val startMs: Long) : CastRequest()
-    data class Images(val urls: List<String>, val names: List<String>, val index: Int) : CastRequest()
+    data class Video(val items: List<VideoItem>, val index: Int, val startMs: Long) : CastRequest() {
+        constructor(url: String, title: String, sub: String?, key: String, startMs: Long) :
+            this(listOf(VideoItem(url, title, sub, key)), 0, startMs)
+    }
+    data class Images(val urls: List<String>, val names: List<String>, val index: Int, val slideshow: Boolean = false) : CastRequest()
 }
 
 interface CastController {
@@ -20,5 +34,7 @@ object Bus {
     @Volatile var controller: CastController? = null
     @Volatile var status: String = IDLE
     @Volatile var onPhoneChanged: (() -> Unit)? = null
+    @Volatile var onPaired: (() -> Unit)? = null
+    @Volatile var onPairRequest: (() -> Unit)? = null
     val main = Handler(Looper.getMainLooper())
 }

@@ -72,70 +72,159 @@ class BootReceiver : BroadcastReceiver() {
 }
 
 class CastServer(private val ctx: Context) : NanoHTTPD(PORT) {
+    @Volatile private var lastPairStart = 0L
+    private val worker = java.util.concurrent.Executors.newSingleThreadExecutor()
 
-    override fun serve(s: IHTTPSession): Response = try {
-        when (s.uri) {
-            "/ping" -> json(JSONObject().put("app", "tvcast").put("name", deviceName(ctx)).toString())
-            "/play" -> {
-                val j = JSONObject(body(s))
-                Bus.pending = CastRequest.Video(
-                    j.getString("url"),
-                    j.optString("title"),
-                    if (j.isNull("sub")) null else j.getString("sub"),
-                    j.optString("key"),
-                    j.optLong("startMs"),
-                )
-                openPlayer()
-                json("{\"ok\":true}")
-            }
-            "/images" -> {
-                val j = JSONObject(body(s))
-                Bus.pending = CastRequest.Images(j.getJSONArray("urls").strings(), j.optJSONArray("names")?.strings().orEmpty(), j.optInt("index"))
-                openPlayer()
-                json("{\"ok\":true}")
-            }
-            "/control" -> {
-                val cmd = s.parameters["cmd"]?.firstOrNull().orEmpty()
-                val v = s.parameters["v"]?.firstOrNull()
-                Bus.main.post { Bus.controller?.onCommand(cmd, v) }
-                json("{\"ok\":true}")
-            }
-            "/status" -> json(Bus.status)
-            "/history" -> json(History.all(ctx).toString())
-            "/hello" -> {
-                val j = JSONObject(body(s))
-                ctx.getSharedPreferences("phone", Context.MODE_PRIVATE).edit()
-                    .putString("base", j.getString("base")).putString("name", j.optString("name", "Phone")).apply()
-                Bus.main.post { Bus.onPhoneChanged?.invoke() }
-                json("{\"ok\":true}")
-            }
-            "/clear" -> {
-                clearAll(ctx)
-                json("{\"ok\":true}")
-            }
-            else -> newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "not found")
+    override fun serve(s: IHTTPSession): Response {
+        return try {
+            serveChecked(s)
+        } catch (e: Exception) {
+            Log.w("TvCast", "request failed")
+            status(Response.Status.BAD_REQUEST, "bad request")
         }
-    } catch (e: Exception) {
-        newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, e.toString())
+    }
+
+    private fun serveChecked(s: IHTTPSession): Response {
+        val body = readBody(s) ?: return status(Response.Status.PAYLOAD_TOO_LARGE, "too large")
+        return when (s.uri) {
+            // Open endpoints: discovery and pairing only.
+            "/ping" -> {
+                val paired = Auth.verify(ctx, s.method.name, s.uri, s.queryParameterString, body, s.headers)
+                json(JSONObject().put("app", "tvcast").put("name", deviceName(ctx)).put("id", Auth.tvId(ctx))
+                    .put("paired", paired).put("version", 2).toString())
+            }
+            "/pair/start" -> {
+                val now = System.currentTimeMillis()
+                if (now - lastPairStart < 5000) return status(Response.Status.TOO_MANY_REQUESTS, "wait")
+                lastPairStart = now
+                val j = runCatching { JSONObject(String(body)) }.getOrNull() ?: JSONObject()
+                if (!Auth.startPairing(j.optString("name").ifBlank { "Phone" }, j.optString("phoneId"))) {
+                    return status(Response.Status.FORBIDDEN, "locked")
+                }
+                // The Allow/Deny prompt appears on whichever TV Cast screen is open (home or player).
+                Bus.main.post { Bus.onPairRequest?.invoke() }
+                json("{\"ok\":true}")
+            }
+            "/pair/finish" -> {
+                val j = JSONObject(String(body))
+                val (state, key) = Auth.poll(j.optString("phoneId"))
+                when (state) {
+                    Auth.State.ALLOWED -> json(JSONObject().put("state", "allowed").put("key", key).put("id", Auth.tvId(ctx)).toString())
+                    Auth.State.WAITING -> json("{\"state\":\"waiting\"}")
+                    Auth.State.DENIED -> status(Response.Status.FORBIDDEN, "denied")
+                }
+            }
+            else -> {
+                if (!Auth.verify(ctx, s.method.name, s.uri, s.queryParameterString, body, s.headers)) {
+                    status(Response.Status.UNAUTHORIZED, "not paired")
+                } else {
+                    secured(s, String(body, Charsets.UTF_8))
+                }
+            }
+        }
+    }
+
+    private fun secured(s: IHTTPSession, body: String): Response = when (s.uri) {
+        "/play" -> {
+            val j = JSONObject(body)
+            val items = if (j.has("items")) {
+                val a = j.getJSONArray("items")
+                List(a.length()) { i ->
+                    val o = a.getJSONObject(i)
+                    VideoItem(safeUrl(o.getString("url")), o.optString("title"),
+                        o.optString("sub").takeIf { it.isNotEmpty() }?.let { safeUrl(it) }, o.optString("key"))
+                }
+            } else {
+                listOf(VideoItem(safeUrl(j.getString("url")), j.optString("title"),
+                    if (j.isNull("sub")) null else safeUrl(j.getString("sub")), j.optString("key")))
+            }
+            if (items.isEmpty()) status(Response.Status.BAD_REQUEST, "empty") else {
+                Bus.pending = CastRequest.Video(items, j.optInt("index").coerceIn(0, items.size - 1), j.optLong("startMs"))
+                openPlayer()
+                ok()
+            }
+        }
+        "/images" -> {
+            val j = JSONObject(body)
+            val urls = j.getJSONArray("urls").strings().map { safeUrl(it) }
+            Bus.pending = CastRequest.Images(urls, j.optJSONArray("names")?.strings().orEmpty(), j.optInt("index"), j.optBoolean("slideshow"))
+            openPlayer()
+            ok()
+        }
+        "/url" -> {
+            // Online link: resolved off the request thread (may need to load a web page first).
+            val j = JSONObject(body)
+            val url = safeUrl(j.getString("url"))
+            worker.execute { Online.open(ctx, url, j.optString("title")) }
+            ok()
+        }
+        "/radio" -> {
+            val j = JSONObject(body)
+            val item = VideoItem(safeUrl(j.getString("url")), j.optString("name", "Radio"), online = true, radio = true,
+                artwork = j.optString("favicon").takeIf { it.startsWith("http") })
+            Bus.pending = CastRequest.Video(listOf(item), 0, 0)
+            openPlayer()
+            ok()
+        }
+        "/control" -> {
+            val cmd = s.parameters["cmd"]?.firstOrNull().orEmpty()
+            val v = s.parameters["v"]?.firstOrNull()
+            Bus.main.post { Bus.controller?.onCommand(cmd, v) }
+            ok()
+        }
+        "/status" -> json(Bus.status)
+        "/history" -> json(History.all(ctx).toString())
+        "/hello" -> {
+            val j = JSONObject(body)
+            ctx.getSharedPreferences("phone", Context.MODE_PRIVATE).edit()
+                .putString("base", safeUrl(j.getString("base"))).putString("name", j.optString("name", "Phone").take(40)).apply()
+            Bus.main.post { Bus.onPhoneChanged?.invoke() }
+            ok()
+        }
+        "/bye" -> {
+            // Phone disconnected: close whatever it was showing.
+            Bus.main.post {
+                Bus.controller?.onCommand("stop", null)
+                Bus.onPhoneChanged?.invoke()
+            }
+            ok()
+        }
+        "/clear" -> {
+            clearAll(ctx)
+            ok()
+        }
+        else -> status(Response.Status.NOT_FOUND, "not found")
+    }
+
+    /** Only plain web links are accepted (no file:, content:, intent: …). */
+    private fun safeUrl(u: String): String {
+        val uri = android.net.Uri.parse(u.trim())
+        require(uri.scheme == "http" || uri.scheme == "https") { "bad url" }
+        require(!uri.host.isNullOrBlank()) { "bad url" }
+        return u.trim()
     }
 
     private fun openPlayer() {
         ctx.startActivity(Intent(ctx, PlayerActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 
+    private fun ok() = json("{\"ok\":true}")
     private fun json(text: String) = newFixedLengthResponse(Response.Status.OK, "application/json", text)
+    private fun status(st: Response.Status, msg: String) = newFixedLengthResponse(st, MIME_PLAINTEXT, msg)
 
-    private fun body(s: IHTTPSession): String {
+    private fun readBody(s: IHTTPSession): ByteArray? {
         val len = s.headers["content-length"]?.toIntOrNull() ?: 0
+        if (len > MAX_BODY) return null
         val buf = ByteArray(len)
-        DataInputStream(s.inputStream).readFully(buf)
-        return String(buf, Charsets.UTF_8)
+        if (len > 0) DataInputStream(s.inputStream).readFully(buf)
+        return buf
     }
 
     private fun JSONArray.strings() = List(length()) { getString(it) }
 
     companion object {
         const val PORT = 8091
+        private const val MAX_BODY = 2 * 1024 * 1024
     }
 }
 

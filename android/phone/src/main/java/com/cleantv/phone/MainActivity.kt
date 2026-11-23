@@ -103,12 +103,22 @@ class MainActivity : AppCompatActivity() {
             override fun onTabReselected(t: TabLayout.Tab) {}
         })
 
-        findViewById<Button>(R.id.btnTv).setOnClickListener { lifecycleScope.launch { pickTv() } }
+        findViewById<Button>(R.id.btnTv).setOnClickListener {
+            lifecycleScope.launch { connectTv(forcePicker = true)?.let { toast("Using ${it.name}") } }
+        }
+        findViewById<Button>(R.id.btnDisconnect).apply {
+            setOnClickListener { disconnect() }
+            setOnLongClickListener { toast("Disconnect from TV"); true }
+        }
         findViewById<Button>(R.id.btnRemote).setOnClickListener {
-            if (Prefs.lastTv(this) == null) toast("Select a TV first")
+            if (Prefs.lastTv(this)?.paired != true) toast("Select a TV first")
             else startActivity(Intent(this, RemoteActivity::class.java))
         }
-        findViewById<Button>(R.id.btnClear).setOnClickListener { confirmClear() }
+        findViewById<Button>(R.id.btnClear).apply {
+            contentDescription = "More"
+            (this as? com.google.android.material.button.MaterialButton)?.setIconResource(android.R.drawable.ic_menu_more)
+            setOnClickListener { moreMenu(it) }
+        }
 
         videoFilter = Filter.load(this, "videos")
         imageFilter = Filter.load(this, "images")
@@ -133,26 +143,143 @@ class MainActivity : AppCompatActivity() {
         if (hasMediaPermission()) maybeAskAllFilesAccess() else permLauncher.launch(mediaPermissions)
     }
 
+    override fun onStart() {
+        super.onStart()
+        ServerService.uiVisible++
+    }
+
+    override fun onStop() {
+        ServerService.uiVisible = (ServerService.uiVisible - 1).coerceAtLeast(0)
+        super.onStop()
+    }
+
     override fun onResume() {
         super.onResume()
-        // Restarts sharing if it stopped itself after being idle.
-        ServerService.start(this)
         updateTvLabel()
         if (hasMediaPermission()) loadMedia()
         refreshHistory()
     }
 
-    /** Reconnects to the TV (following IP changes), announces the library, then pulls resume positions. */
+    /** Reconnects to the TV (following IP changes) and pulls resume positions. No sharing is started. */
     private fun refreshHistory() {
-        if (Prefs.lastTv(this) == null) return
+        if (Prefs.lastTv(this)?.paired != true) return
         lifecycleScope.launch {
-            val tv = TvClient.ensure(this@MainActivity)
+            val tv = TvClient.ensure(this@MainActivity, announce = ServerService.running)
             updateTvLabel(connected = tv != null)
-            if (tv == null) return@launch
+            if (tv == null || !tv.paired) return@launch
             val json = withContext(Dispatchers.IO) { TvClient.history(tv) } ?: return@launch
             Prefs.saveHistory(this@MainActivity, json)
             applyHistory()
         }
+    }
+
+    // ------------------------------------------------------------ More menu
+
+    private fun moreMenu(anchor: View) {
+        val menu = android.widget.PopupMenu(this, anchor)
+        menu.menu.add(0, 1, 0, "Play a link (video / stream / Google Photos)")
+        menu.menu.add(0, 2, 1, "Internet radio (FM stations)")
+        menu.menu.add(0, 3, 2, "Show on TV: browse phone from the TV")
+        menu.menu.add(0, 4, 3, "APK files on this phone")
+        menu.menu.add(0, 5, 4, "Disconnect from TV")
+        menu.menu.add(0, 6, 5, "Clear history")
+        menu.setOnMenuItemClickListener {
+            when (it.itemId) {
+                1 -> askLink()
+                2 -> RadioPicker(this) { url, name, logo -> sendOnline { tv -> TvClient.radio(tv, url, name, logo) } }.show()
+                3 -> lifecycleScope.launch {
+                    val tv = connectTv() ?: return@launch
+                    if (!startSharing()) return@launch
+                    val ok = withContext(Dispatchers.IO) {
+                        val ip = Net.localIpFor(tv.ip) ?: return@withContext false
+                        TvClient.hello(tv, "http://$ip:${MediaServer.PORT}/${Prefs.token(this@MainActivity)}", TvClient.phoneName(this@MainActivity))
+                    }
+                    toast(if (ok) "Open TV Cast on the TV to browse this phone" else "TV not reachable")
+                }
+                4 -> showApks()
+                5 -> disconnect()
+                6 -> confirmClear()
+            }
+            true
+        }
+        menu.show()
+    }
+
+    /**
+     * Online link in private mode: the URL is sent straight to the TV and not kept anywhere
+     * (no history, no recent-links list, no copy in this app's storage).
+     */
+    private fun askLink() {
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            imeOptions = android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+            hint = "https://…"
+            importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+        }
+        val clip = (getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager).primaryClip
+            ?.getItemAt(0)?.text?.toString()?.trim()
+        if (clip != null && (clip.startsWith("http://") || clip.startsWith("https://"))) input.setText(clip)
+        val box = android.widget.FrameLayout(this).apply {
+            val p = (20 * resources.displayMetrics.density).toInt()
+            setPadding(p, 0, p, 0)
+            addView(input)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Play a link on the TV")
+            .setMessage("Video or stream link (mp4, m3u8 …), a web page with a video, a YouTube link, or a Google Photos shared-album link (starts a slideshow).\n\nPrivate: the link isn't saved on the phone or the TV. Ads/trackers are blocked; if a VPN app is running on the TV, it's used.")
+            .setView(box)
+            .setPositiveButton("Play") { _, _ ->
+                val url = input.text.toString().trim()
+                val u = Uri.parse(url)
+                if ((u.scheme != "http" && u.scheme != "https") || u.host.isNullOrBlank()) toast("Enter a link starting with http:// or https://")
+                else sendOnline { tv -> TvClient.url(tv, url) }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun sendOnline(send: (Tv) -> Boolean) {
+        lifecycleScope.launch {
+            val tv = connectTv() ?: return@launch
+            val ok = withContext(Dispatchers.IO) { send(tv) }
+            if (ok) startActivity(Intent(this@MainActivity, RemoteActivity::class.java))
+            else toast("Could not reach ${tv.name}")
+        }
+    }
+
+    private fun showApks() {
+        if (!Environment.isExternalStorageManager()) {
+            toast("Allow \"All files access\" for TV Cast to list APK files")
+            startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
+            return
+        }
+        lifecycleScope.launch {
+            val apks = withContext(Dispatchers.IO) { MediaRepo.apks(this@MainActivity) }
+            if (apks.isEmpty()) { toast("No APK files found on this phone"); return@launch }
+            val fmt = java.text.DateFormat.getDateInstance(java.text.DateFormat.MEDIUM)
+            val labels = apks.map { a ->
+                val title = a.appName?.let { n -> "$n ${a.version?.let { "v$it" }.orEmpty()}" } ?: a.fileName
+                "$title\n${a.fileName} · ${formatSize(a.size).let { if (a.size < 1 shl 20) "${a.size / 1024} KB" else it }} · ${fmt.format(java.util.Date(a.modified))}\n${a.path.substringBeforeLast('/')}"
+            }
+            AlertDialog.Builder(this@MainActivity)
+                .setTitle("APK files (${apks.size})")
+                .setItems(labels.toTypedArray()) { _, which ->
+                    val a = apks[which]
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle(a.appName ?: a.fileName)
+                        .setMessage("File: ${a.fileName}\nPackage: ${a.packageName ?: "unknown (not a valid APK?)"}\nVersion: ${a.version ?: "-"}\nSize: ${formatSize(a.size)}\nFolder: ${a.path.substringBeforeLast('/')}")
+                        .setPositiveButton("OK", null)
+                        .show()
+                }
+                .setPositiveButton("Close", null)
+                .show()
+        }
+    }
+
+    private fun disconnect() {
+        ServerService.disconnect(this)
+        updateTvLabel(connected = false)
+        toast("Disconnected. Sharing stopped.")
     }
 
     private fun applyHistory() {
@@ -298,42 +425,100 @@ class MainActivity : AppCompatActivity() {
 
     private fun onItemClick(pos: Int) {
         val item = shown.getOrNull(pos) ?: return
-        // Slideshow follows what's on screen (filtered/sorted pictures).
-        val imageSnapshot = if (item.isVideo) emptyList() else shown
-        val imageIndex = if (item.isVideo) 0 else pos
+        // Slideshow / play queue follow what's on screen (filtered + sorted).
+        val snapshot = shown.filter { it.isVideo == item.isVideo }.take(MAX_QUEUE)
+        val index = snapshot.indexOf(item).coerceAtLeast(0)
         lifecycleScope.launch {
             val startMs = if (item.isVideo) askResume(item) ?: return@launch else 0L
-            var tv = pickTv() ?: return@launch
-            if (!ServerService.running) {
-                ServerService.start(this@MainActivity)
-                delay(700)
-            }
-            if (withContext(Dispatchers.IO) { Net.localIp() } == null) {
-                toast("Phone is not on Wi-Fi or hotspot")
-                return@launch
-            }
+            val tv = connectTv() ?: return@launch
+            if (!startSharing()) return@launch
             toast("Sending to ${tv.name}…")
-            suspend fun send(t: Tv) = withContext(Dispatchers.IO) {
+            val ok = withContext(Dispatchers.IO) {
                 // Use the phone address on the TV's network (home Wi-Fi or this phone's hotspot).
-                val ip = Net.localIpFor(t.ip) ?: return@withContext false
+                val ip = Net.localIpFor(tv.ip) ?: return@withContext false
                 val base = "http://$ip:${MediaServer.PORT}/${Prefs.token(this@MainActivity)}"
+                TvClient.hello(tv, base, TvClient.phoneName(this@MainActivity))
                 if (item.isVideo) {
-                    val sub = MediaRepo.findSubtitle(this@MainActivity, item.id)
-                        ?.let { "$base/s/${item.id}.${it.extension.lowercase()}" }
-                    TvClient.play(t, "$base/v/${item.id}", item.name, sub, item.key, startMs)
+                    val subs = MediaRepo.subtitleExts(this@MainActivity)
+                    val items = org.json.JSONArray()
+                    snapshot.forEach { m ->
+                        items.put(org.json.JSONObject().put("url", "$base/v/${m.id}").put("title", m.name).put("key", m.key)
+                            .put("sub", subs[m.id]?.let { "$base/s/${m.id}.$it" } ?: ""))
+                    }
+                    TvClient.play(tv, items, index, startMs)
                 } else {
-                    TvClient.images(t, imageSnapshot.map { "$base/i/${it.id}" }, imageSnapshot.map { it.name }, imageIndex)
+                    TvClient.images(tv, snapshot.map { "$base/i/${it.id}" }, snapshot.map { it.name }, index)
                 }
-            }
-            var ok = send(tv)
-            if (!ok) {
-                // TV may have a new IP address; look for it by name and try once more.
-                TvClient.ensure(this@MainActivity)?.let { tv = it; ok = send(it) }
             }
             updateTvLabel(connected = ok)
             if (ok) startActivity(Intent(this@MainActivity, RemoteActivity::class.java))
             else toast("Could not reach ${tv.name}. Is the TV on and on the same Wi-Fi?")
         }
+    }
+
+    /** Starts the phone's media sharing (only now, when something is about to play). */
+    private suspend fun startSharing(): Boolean {
+        if (withContext(Dispatchers.IO) { Net.localIp() } == null) {
+            toast("Phone is not on Wi-Fi or hotspot")
+            return false
+        }
+        if (!ServerService.running) {
+            ServerService.start(this)
+            repeat(20) { if (!ServerService.running) delay(100) }
+            delay(300)
+        }
+        return true
+    }
+
+    /**
+     * The TV to use: the saved one straight away if it's reachable and paired (no picker),
+     * otherwise the picker, then pairing if needed.
+     */
+    private suspend fun connectTv(forcePicker: Boolean = false): Tv? {
+        if (!forcePicker) {
+            val saved = Prefs.lastTv(this)
+            if (saved != null) {
+                val tv = TvClient.ensure(this, announce = false)
+                if (tv != null) {
+                    updateTvLabel(connected = true)
+                    return if (tv.paired) tv else pair(tv)
+                }
+                toast("${saved.name} not found. Choose a TV.")
+            }
+        }
+        val picked = pickTv() ?: return null
+        return if (picked.paired) picked else pair(picked)
+    }
+
+    /** One-time pairing: the TV asks "Allow this phone?"; we wait for Allow. */
+    private suspend fun pair(tv: Tv): Tv? {
+        val name = TvClient.phoneName(this)
+        withContext(Dispatchers.IO) { TvClient.pairStart(tv, name) }?.let { toast(it); return null }
+
+        var cancelled = false
+        val waiting = AlertDialog.Builder(this)
+            .setTitle("Allow on the TV")
+            .setMessage("On ${tv.name}, choose Allow to let this phone use it.\n\nIf nothing appears, open TV Cast on the TV — the question shows there.")
+            .setNegativeButton("Cancel") { _, _ -> cancelled = true }
+            .setOnCancelListener { cancelled = true }
+            .show()
+        val deadline = System.currentTimeMillis() + 2 * 60 * 1000L
+        var result: String? = "waiting"
+        while (!cancelled && result == "waiting" && System.currentTimeMillis() < deadline) {
+            delay(1500)
+            result = withContext(Dispatchers.IO) { TvClient.pairPoll(tv) } ?: "waiting"
+        }
+        if (waiting.isShowing) waiting.dismiss()
+        when {
+            cancelled -> return null
+            result == "denied" -> { toast("${tv.name} denied the request"); return null }
+            result != "allowed" -> { toast("No answer from ${tv.name}. Try again."); return null }
+        }
+        val paired = withContext(Dispatchers.IO) { TvClient.ping(tv.ip, 2000, tv.id) } ?: tv.copy(paired = true)
+        Prefs.saveTv(this, paired)
+        updateTvLabel(connected = true)
+        toast("Paired with ${tv.name}")
+        return paired
     }
 
     /** Returns the start position (0 = beginning), or null if the user cancelled. */
@@ -377,8 +562,6 @@ class MainActivity : AppCompatActivity() {
             scanJob?.cancel()
             if (tv != null) {
                 Prefs.saveTv(this, tv)
-                // Let the TV know about this phone so its home screen can list the phone's files.
-                lifecycleScope.launch { updateTvLabel(connected = TvClient.ensure(this@MainActivity) != null) }
             }
             updateTvLabel()
             if (cont.isActive) cont.resume(tv)
@@ -456,5 +639,6 @@ class MainActivity : AppCompatActivity() {
         private const val TAB_RECENT = 0
         private const val TAB_VIDEOS = 1
         private const val TAB_PICTURES = 2
+        private const val MAX_QUEUE = 300
     }
 }

@@ -40,6 +40,9 @@ class RemoteActivity : AppCompatActivity() {
     private var failures = 0
     private var reconnecting = false
     private var last: JSONObject? = null
+    private lateinit var queueRow: View
+    private lateinit var btnPicMode: Button
+    private lateinit var btnSoundMode: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -97,6 +100,18 @@ class RemoteActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnPanD).setOnClickListener { send("pan", "down") }
         findViewById<Button>(R.id.btnResetView).setOnClickListener { send("resetview") }
         findViewById<Button>(R.id.btnStop).setOnClickListener { send("stop"); finish() }
+        findViewById<Button>(R.id.btnDisconnect).setOnClickListener {
+            ServerService.disconnect(this)
+            Toast.makeText(this, "Disconnected. Sharing stopped.", Toast.LENGTH_SHORT).show()
+            finish()
+        }
+        queueRow = findViewById(R.id.queueRow)
+        findViewById<Button>(R.id.btnPrevVideo).setOnClickListener { send("prev") }
+        findViewById<Button>(R.id.btnNextVideo).setOnClickListener { send("next") }
+        btnPicMode = findViewById(R.id.btnPicMode)
+        btnSoundMode = findViewById(R.id.btnSoundMode)
+        btnPicMode.setOnClickListener { pickMode("Picture mode", "picModes", "picMode", "picmode") { customPicture() } }
+        btnSoundMode.setOnClickListener { pickMode("Sound mode", "soundModes", "soundMode", "soundmode") { customSound() } }
 
         seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(s: SeekBar, progress: Int, fromUser: Boolean) {
@@ -119,13 +134,83 @@ class RemoteActivity : AppCompatActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        ServerService.uiVisible++
+    }
+
+    override fun onStop() {
+        ServerService.uiVisible = (ServerService.uiVisible - 1).coerceAtLeast(0)
+        super.onStop()
+    }
+
     private fun send(cmd: String, v: String? = null) {
-        // Keep the phone's media server up while the remote is in use (it may have idled out).
-        ServerService.start(this)
+        // If the TV is showing this phone's media and sharing was stopped (e.g. phone killed it), restart it.
+        val s = last
+        if (s != null && !s.optBoolean("online") && s.optString("mode") in listOf("video", "images") && !ServerService.running) {
+            ServerService.start(this)
+        }
         lifecycleScope.launch {
             withContext(Dispatchers.IO) { TvClient.control(tv, cmd, v) }
             poll()
         }
+    }
+
+    /** Preset picker for picture/sound modes; "Custom" opens sliders. */
+    private fun pickMode(title: String, listField: String, curField: String, cmd: String, custom: () -> Unit) {
+        val a = last?.optJSONArray(listField) ?: return
+        val modes = List(a.length()) { a.getString(it) }
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setSingleChoiceItems(modes.toTypedArray(), modes.indexOf(last?.optString(curField))) { d, which ->
+                d.dismiss()
+                if (modes[which] == "Custom") custom() else send(cmd, modes[which])
+            }
+            .show()
+    }
+
+    private fun customPicture() {
+        val c = last?.optJSONArray("picCustom")
+        val vals = IntArray(4) { c?.optInt(it) ?: listOf(0, 100, 100, 0)[it] }
+        sliders(
+            "Custom picture",
+            listOf(Slider("Brightness", -50, 50, vals[0]), Slider("Contrast %", 50, 150, vals[1]),
+                Slider("Colour %", 0, 200, vals[2]), Slider("Warmth", -50, 50, vals[3]))
+        ) { v -> send("piccustom", v.joinToString(",")) }
+    }
+
+    private fun customSound() {
+        val c = last?.optJSONArray("soundCustom")
+        val names = listOf("Bass", "Low mid", "Mid (voices)", "High mid", "Treble")
+        val rows = names.mapIndexed { i, n -> Slider("$n (dB)", -12, 12, c?.optInt(i) ?: 0) } +
+            Slider("Loudness boost (dB)", 0, 12, c?.optInt(5) ?: 0)
+        sliders("Custom sound", rows) { v -> send("soundcustom", v.joinToString(",")) }
+    }
+
+    private data class Slider(val label: String, val min: Int, val max: Int, val value: Int)
+
+    private fun sliders(title: String, rows: List<Slider>, onChange: (List<Int>) -> Unit) {
+        val d = resources.displayMetrics.density
+        val box = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding((24 * d).toInt(), (8 * d).toInt(), (24 * d).toInt(), 0)
+        }
+        val bars = rows.map { r ->
+            val text = TextView(this)
+            val bar = SeekBar(this).apply { max = r.max - r.min; progress = r.value - r.min }
+            text.text = "${r.label}: ${r.value}"
+            box.addView(text); box.addView(bar)
+            Triple(r, text, bar)
+        }
+        fun values() = bars.map { (r, _, b) -> b.progress + r.min }
+        bars.forEach { (r, text, bar) ->
+            bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) { text.text = "${r.label}: ${p + r.min}" }
+                override fun onStartTrackingTouch(s: SeekBar) {}
+                override fun onStopTrackingTouch(s: SeekBar) { onChange(values()) }
+            })
+        }
+        AlertDialog.Builder(this).setTitle(title).setView(box).setPositiveButton("Done", null).show()
     }
 
     private fun pickTrack(title: String, field: String, cmd: String, withOff: Boolean) {
@@ -224,14 +309,26 @@ class RemoteActivity : AppCompatActivity() {
                 imagePanel.visibility = View.GONE
                 title.text = s.optString("title")
                 val playing = s.optBoolean("playing")
+                val online = s.optBoolean("online")
+                val q = s.optInt("qCount")
                 state.text = when {
                     s.optBoolean("reconnecting") -> "Connection lost — TV is reconnecting and will continue from the same spot…"
+                    s.optString("error").isNotEmpty() && online -> "Can't play this link (${s.optString("error")})."
                     s.optString("error").isNotEmpty() -> "Cannot play (${s.optString("error")}). Try \"Play in another TV player\"."
                     s.optBoolean("ended") -> "Finished"
                     s.optBoolean("buffering") -> "Buffering…"
                     playing -> "Playing"
                     else -> "Paused"
+                } + when {
+                    s.optBoolean("radio") -> "  ·  Live radio"
+                    online -> "  ·  Private link · ads blocked · VPN ${if (s.optBoolean("vpn")) "on" else "off"}"
+                    q > 1 -> "  ·  ${s.optInt("qIndex") + 1} of $q"
+                    else -> ""
                 }
+                queueRow.visibility = if (q > 1) View.VISIBLE else View.GONE
+                btnPicMode.text = "Picture: ${s.optString("picMode", "Standard")}"
+                btnSoundMode.text = "Sound: ${s.optString("soundMode", "Standard")}"
+                findViewById<View>(R.id.btnExternal).visibility = if (online) View.GONE else View.VISIBLE
                 btnPlay.setIconResource(if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play)
                 btnSubs.text = if (s.optBoolean("subs", true)) "Subtitles: On" else "Subtitles: Off"
                 btnAudio.text = "Audio (${s.optJSONArray("audioTracks")?.length() ?: 0})"

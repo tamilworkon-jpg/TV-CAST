@@ -1,0 +1,34 @@
+name: TVCast
+options:
+  bundleIdPrefix: com.cleantv
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    TARGETED_DEVICE_FAMILY: "1"
+targets:
+  TVCast:
+    type: application
+    platform: iOS
+    sources: [TVCast]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cleantv.ios
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+    info:
+      path: TVCast/Info.plist
+      properties:
+        CFBundleDisplayName: TV Cast
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        NSPhotoLibraryUsageDescription: TV Cast shows your videos and photos so you can play them on your TV.
+        NSLocalNetworkUsageDescription: TV Cast finds your Fire TV on this Wi-Fi and streams your videos and photos to it.
+        NSAppTransportSecurity:
+          # Plain HTTP only to devices on the local network (the TV); internet requests stay HTTPS-only.
+          NSAllowsLocalNetworking: true

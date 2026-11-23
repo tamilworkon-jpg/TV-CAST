@@ -88,25 +88,32 @@ object MediaRepo {
         }.minByOrNull { it.name.length }
     }
 
-    /** Whole library as JSON for the TV's browser. Each folder is listed once to find subtitles. */
+    /** Subtitle extension (srt/vtt) for every video that has one next to it. Each folder is listed once. */
     @Suppress("DEPRECATION")
-    fun libraryJson(ctx: Context): String {
-        val paths = HashMap<Long, String>()
+    fun subtitleExts(ctx: Context): Map<Long, String> {
+        val out = HashMap<Long, String>()
+        val dirCache = HashMap<String, List<File>>()
         ctx.contentResolver.query(
             videoCollection, arrayOf(MediaStore.Video.Media._ID, MediaStore.Video.Media.DATA), null, null, null
-        )?.use { c -> while (c.moveToNext()) c.getString(1)?.let { paths[c.getLong(0)] = it } }
-        val dirCache = HashMap<String, List<File>>()
+        )?.use { c ->
+            while (c.moveToNext()) {
+                val f = File(c.getString(1) ?: continue)
+                val dir = f.parent ?: continue
+                val sibs = dirCache.getOrPut(dir) { f.parentFile?.listFiles()?.toList().orEmpty() }
+                matchSubtitle(f, sibs)?.let { out[c.getLong(0)] = it.extension.lowercase() }
+            }
+        }
+        return out
+    }
 
+    /** Whole library as JSON for the TV's browser. */
+    fun libraryJson(ctx: Context): String {
+        val subs = subtitleExts(ctx)
         val v = JSONArray()
         for (m in videos(ctx)) {
             val o = JSONObject().put("id", m.id).put("name", m.name).put("size", m.size)
                 .put("dur", m.durationMs).put("key", m.key).put("folder", m.folder).put("date", m.dateAdded)
-            paths[m.id]?.let { p ->
-                val f = File(p)
-                val dir = f.parent ?: return@let
-                val sibs = dirCache.getOrPut(dir) { f.parentFile?.listFiles()?.toList().orEmpty() }
-                matchSubtitle(f, sibs)?.let { o.put("sub", it.extension.lowercase()) }
-            }
+            subs[m.id]?.let { o.put("sub", it) }
             v.put(o)
         }
         val i = JSONArray()
@@ -116,4 +123,34 @@ object MediaRepo {
         )
         return JSONObject().put("videos", v).put("images", i).toString()
     }
+
+    /** APK files on the phone (Download, WhatsApp, etc.). Needs All-files access to see every folder. */
+    fun apks(ctx: Context): List<ApkFile> {
+        val out = mutableListOf<ApkFile>()
+        val col = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        @Suppress("DEPRECATION")
+        val proj = arrayOf(MediaStore.Files.FileColumns.DISPLAY_NAME, MediaStore.Files.FileColumns.SIZE,
+            MediaStore.Files.FileColumns.DATE_MODIFIED, MediaStore.Files.FileColumns.DATA)
+        ctx.contentResolver.query(
+            col, proj, "${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE ?", arrayOf("%.apk"),
+            "${MediaStore.Files.FileColumns.DATE_MODIFIED} DESC"
+        )?.use { c ->
+            while (c.moveToNext()) {
+                val path = c.getString(3) ?: continue
+                val info = runCatching { ctx.packageManager.getPackageArchiveInfo(path, 0) }.getOrNull()
+                info?.applicationInfo?.let { it.sourceDir = path; it.publicSourceDir = path }
+                val label = info?.applicationInfo?.let { runCatching { ctx.packageManager.getApplicationLabel(it).toString() }.getOrNull() }
+                out += ApkFile(
+                    c.getString(0) ?: File(path).name, c.getLong(1), c.getLong(2) * 1000, path,
+                    label, info?.packageName, info?.versionName,
+                )
+            }
+        }
+        return out
+    }
 }
+
+data class ApkFile(
+    val fileName: String, val size: Long, val modified: Long, val path: String,
+    val appName: String?, val packageName: String?, val version: String?,
+)

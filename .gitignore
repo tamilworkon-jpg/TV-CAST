@@ -13,6 +13,12 @@ android/keystore/
 tools/
 downloads/
 
+# iOS build output (project is generated from ios/project.yml by XcodeGen)
+ios/build/
+ios/Payload/
+ios/*.xcodeproj/
+*.ipa
+
 # IDE / OS
 .idea/
 *.iml

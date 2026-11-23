@@ -58,6 +58,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
     private var ticks = 0
     private var cachedPlayers: List<Pair<String, String>> = emptyList()
     private var reconnecting = false
+    private var queue: MutableList<VideoItem> = mutableListOf()
     private var rotation = 0
     private var zoom = 1f
     private var panX = 0f
@@ -71,6 +72,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
         override fun run() {
             publishStatus()
             if (++ticks % 10 == 0) saveProgress()
+            if (ticks % 2 == 0) PairDialog.showIfPending(this@PlayerActivity)
             handler.postDelayed(this, 500)
         }
     }
@@ -108,6 +110,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
             }
         }
         image.addOnLayoutChangeListener(relayout)
+        applyLook()
         Bus.controller = this
         handleRequest()
         handler.post(ticker)
@@ -136,30 +139,39 @@ class PlayerActivity : AppCompatActivity(), CastController {
         saveProgress()
         stopSlideshow()
         mode = "video"
-        title = r.title
-        key = r.key
-        videoUrl = r.url
-        subUrl = r.sub
+        queue = r.items.toMutableList()
         image.visibility = View.GONE
         playerView.visibility = View.VISIBLE
         val p = player ?: createPlayer()
         resetView()
         reconnecting = false
         handler.removeCallbacks(reconnectStep)
+        handler.removeCallbacks(closeIfEnded)
         p.trackSelectionParameters = p.trackSelectionParameters.buildUpon().clearOverrides().build()
         p.setPlaybackSpeed(1f)
-        p.setMediaItem(buildItem(r.url, r.sub, r.title), r.startMs.coerceAtLeast(0))
+        p.setMediaItems(queue.map { buildItem(it) }, r.index, r.startMs.coerceAtLeast(0))
         p.prepare()
         p.playWhenReady = true
-        val hint = "Press ☰ for audio, subtitles, rotate, zoom, screen size, volume, VLC/MX"
-        showCaption(if (r.startMs > 0) "${r.title}\nResuming from ${fmt(r.startMs)}\n$hint" else "${r.title}\n$hint", 5000)
+        syncCurrent()
+        val c = current ?: return
+        val hint = when {
+            c.radio -> "Live radio · ☰ for sound modes and volume"
+            c.online -> "Private mode: nothing about this link is saved · ☰ for options"
+            else -> "☰ for audio, subtitles, picture & sound modes, rotate, zoom, VLC/MX"
+        }
+        val next = if (queue.size > 1) "\n${r.index + 1} of ${queue.size} · ⏭ for next video" else ""
+        showCaption((if (r.startMs > 0) "${c.title}\nResuming from ${fmt(r.startMs)}" else c.title) + next + "\n$hint", 5000)
     }
 
-    private fun buildItem(url: String, sub: String?, title: String): MediaItem {
+    private fun buildItem(v: VideoItem): MediaItem {
         val item = MediaItem.Builder()
-            .setUri(url)
-            .setMediaMetadata(MediaMetadata.Builder().setTitle(title).build())
-        if (sub != null) {
+            .setUri(v.url)
+            .setMediaId(v.key)
+            .setMediaMetadata(MediaMetadata.Builder().setTitle(v.title).build())
+        val path = Uri.parse(v.url).path.orEmpty().lowercase()
+        if (path.endsWith(".m3u8")) item.setMimeType(MimeTypes.APPLICATION_M3U8)
+        if (path.endsWith(".mpd")) item.setMimeType(MimeTypes.APPLICATION_MPD)
+        v.sub?.let { sub ->
             val mime = if (sub.endsWith(".vtt")) MimeTypes.TEXT_VTT else MimeTypes.APPLICATION_SUBRIP
             item.setSubtitleConfigurations(
                 listOf(
@@ -175,8 +187,48 @@ class PlayerActivity : AppCompatActivity(), CastController {
         return item.build()
     }
 
-    /** "http://ip:8090/<token>" part of the current media URL; used for keep-alive and reconnect. */
+    /** Current queue entry. */
+    private val current: VideoItem? get() = queue.getOrNull(player?.currentMediaItemIndex ?: 0)
+
+    /** Mirrors the current queue entry into title/key/videoUrl/subUrl. */
+    private fun syncCurrent() {
+        val c = current ?: return
+        title = c.title
+        key = if (c.online) "" else c.key // private mode: online links never reach History
+        videoUrl = c.url
+        subUrl = c.sub
+        radioView(c)
+    }
+
+    /** Live radio: show the station logo instead of an empty video area. */
+    private fun radioView(c: VideoItem) {
+        if (!c.radio) {
+            image.visibility = View.GONE
+            playerView.controllerShowTimeoutMs = 5000
+            return
+        }
+        image.visibility = View.VISIBLE
+        image.scaleType = ImageView.ScaleType.CENTER_INSIDE
+        if (c.artwork != null) image.load(c.artwork, imageLoader(this)) { error(R.drawable.ic_launcher) }
+        else image.setImageResource(R.drawable.ic_launcher)
+        playerView.controllerShowTimeoutMs = 0
+        playerView.showController()
+    }
+
+    private fun skip(dir: Int) {
+        val p = player ?: return
+        if (queue.size < 2) { showCaption("No other videos in this list", 1500); return }
+        saveProgress()
+        if (dir > 0) {
+            if (p.hasNextMediaItem()) p.seekToNextMediaItem() else showCaption("This is the last video", 1500)
+        } else {
+            if (p.hasPreviousMediaItem()) p.seekToPreviousMediaItem() else p.seekTo(0)
+        }
+    }
+
+    /** "http://ip:8090/<token>" part of the current phone media URL; used for keep-alive and reconnect. */
     private fun currentBase(): String? {
+        if (mode == "video" && current?.online == true) return null
         val url = when (mode) {
             "video" -> videoUrl
             "images" -> urls.getOrNull(index)
@@ -206,6 +258,12 @@ class PlayerActivity : AppCompatActivity(), CastController {
         }
     }
 
+    /** Tells the phone the TV no longer needs it, so it can stop sharing right away. */
+    private fun sayBye() {
+        val b = currentBase() ?: return
+        Thread { httpOk("$b/bye") }.start()
+    }
+
     private fun latestPhoneBase(): String? =
         getSharedPreferences("phone", MODE_PRIVATE).getString("base", null)
 
@@ -223,21 +281,25 @@ class PlayerActivity : AppCompatActivity(), CastController {
     private val reconnectStep: Runnable = object : Runnable {
         override fun run() {
             if (!reconnecting || mode != "video") return
+            val online = current?.online == true
             val oldBase = currentBase()
-            val candidates = listOfNotNull(latestPhoneBase(), oldBase).distinct()
+            val candidates = if (online) emptyList() else listOfNotNull(latestPhoneBase(), oldBase).distinct()
             io.execute {
-                val good = candidates.firstOrNull { httpOk("$it/alive") }
+                val good = if (online) "online" else candidates.firstOrNull { httpOk("$it/alive") }
                 runOnUiThread {
                     if (!reconnecting || isFinishing) return@runOnUiThread
                     val p = player ?: return@runOnUiThread
                     if (good != null) {
-                        if (oldBase != null && good != oldBase) {
-                            // Phone got a new IP address: switch the links, keep the position.
-                            videoUrl = videoUrl.replace(oldBase, good)
-                            subUrl = subUrl?.replace(oldBase, good)
-                            p.setMediaItem(buildItem(videoUrl, subUrl, title), resumeAt)
+                        val idx = p.currentMediaItemIndex
+                        if (!online && oldBase != null && good != oldBase) {
+                            // Phone got a new IP address: switch every link in the list, keep the position.
+                            queue = queue.map { v ->
+                                v.copy(url = v.url.replace(oldBase, good), sub = v.sub?.replace(oldBase, good))
+                            }.toMutableList()
+                            p.setMediaItems(queue.map { buildItem(it) }, idx, resumeAt)
+                            syncCurrent()
                         } else {
-                            p.seekTo(resumeAt)
+                            p.seekTo(idx, resumeAt)
                         }
                         p.prepare()
                         p.playWhenReady = true
@@ -264,8 +326,8 @@ class PlayerActivity : AppCompatActivity(), CastController {
 
     private fun createPlayer(): ExoPlayer {
         val renderers = DefaultRenderersFactory(this).setEnableDecoderFallback(true)
-        // Ride out short Wi-Fi blips silently (retries with back-off, ~30 s) before reporting an error.
-        val sources = androidx.media3.exoplayer.source.DefaultMediaSourceFactory(this)
+        // Ad/tracker requests are refused at the network layer; short Wi-Fi blips are retried silently.
+        val sources = androidx.media3.exoplayer.source.DefaultMediaSourceFactory(AdBlock.dataSourceFactory(this))
             .setLoadErrorHandlingPolicy(androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy(10))
         val p = ExoPlayer.Builder(this, renderers)
             .setMediaSourceFactory(sources)
@@ -279,12 +341,38 @@ class PlayerActivity : AppCompatActivity(), CastController {
             .build()
         p.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
+                val online = current?.online == true
                 // 2xxx = network/IO errors: the file is fine, the connection isn't. Reconnect automatically.
-                if (error.errorCode in 2000..2999 && mode == "video") {
+                if (error.errorCode in 2000..2999 && mode == "video" && !online) {
                     startReconnect()
+                } else if (online) {
+                    showCaption("Can't play this link (${error.errorCodeName}).\nIt may need a website login, or it isn't a direct video/stream link.", 15_000)
                 } else {
                     showCaption("Cannot play: ${error.errorCodeName}\nPress ☰ (menu) to open in VLC / MX Player", 15_000)
                 }
+            }
+
+            override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
+                if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) return
+                syncCurrent()
+                resetView()
+                val c = current ?: return
+                val p = player ?: return
+                // Next video in the list: continue where it was left, if it was half watched.
+                val h = if (c.online) null else History.find(this@PlayerActivity, c.key)
+                val pos = h?.optLong("pos") ?: 0L
+                val dur = h?.optLong("dur") ?: 0L
+                val n = "(${p.currentMediaItemIndex + 1} of ${queue.size})"
+                if (pos > 10_000 && dur > 0 && pos < dur - 30_000) {
+                    p.seekTo(pos)
+                    showCaption("${c.title}\nResumed from ${fmt(pos)}  $n", 4000)
+                } else {
+                    showCaption("${c.title}  $n", 3000)
+                }
+            }
+
+            override fun onAudioSessionIdChanged(audioSessionId: Int) {
+                Sound.attach(this@PlayerActivity, audioSessionId)
             }
 
             override fun onPlaybackStateChanged(state: Int) {
@@ -307,6 +395,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
 
     private fun releasePlayer() {
         saveProgress()
+        Sound.release()
         playerView.player = null
         player?.release()
         player = null
@@ -491,13 +580,128 @@ class PlayerActivity : AppCompatActivity(), CastController {
             }
         }
         entries += "Restart from beginning" to { p.seekTo(0); p.play() }
-        players.forEach { (pkg, name) -> entries += "Play in $name" to { openExternal(pkg) } }
-        entries += "Open with other app…" to { openExternal(null) }
+        if (queue.size > 1) {
+            entries += "Next video  (${p.currentMediaItemIndex + 1} of ${queue.size})" to { skip(1) }
+            entries += "Previous video" to { skip(-1) }
+        }
+        entries += "Picture mode:  ${Look.mode(this)}" to { pickPictureMode() }
+        entries += "Sound mode:  ${Sound.mode(this)}" to { pickSoundMode() }
+        if (current?.online != true) {
+            players.forEach { (pkg, name) -> entries += "Play in $name" to { openExternal(pkg) } }
+            entries += "Open with other app…" to { openExternal(null) }
+        }
+        entries += "Disconnect phone & close" to { disconnect() }
 
         AlertDialog.Builder(this)
             .setTitle(title)
             .setItems(entries.map { it.first }.toTypedArray()) { _, which -> entries[which].second() }
             .show()
+    }
+
+    // -------------------------------------------------- picture & sound modes
+
+    private fun applyLook() {
+        val f = Look.filter(this)
+        (playerView.videoSurfaceView as? android.view.TextureView)?.let { tv ->
+            tv.setLayerPaint(f?.let { android.graphics.Paint().apply { colorFilter = it } })
+        }
+        image.colorFilter = f
+    }
+
+    private fun pickPictureMode() {
+        val modes = Look.PRESETS.keys.toList()
+        choose("Picture mode", modes, modes.indexOf(Look.mode(this))) {
+            if (modes[it] == "Custom") customPicture()
+            else { Look.setMode(this, modes[it]); applyLook(); showCaption("Picture: ${modes[it]}", 1500) }
+        }
+    }
+
+    /** Remote-friendly sliders: Up/Down to move between them, Left/Right to change. */
+    private fun customPicture() {
+        val c = Look.custom(this)
+        val rows = listOf(
+            Triple("Brightness", c.brightness + 50, 100),
+            Triple("Contrast", c.contrast - 50, 100),
+            Triple("Colour", c.saturation, 200),
+            Triple("Warmth", c.warmth + 50, 100),
+        )
+        sliders("Custom picture", rows) { v ->
+            Look.setCustom(this, Look.Params(v[0] - 50, v[1] + 50, v[2], v[3] - 50))
+            applyLook()
+        }
+    }
+
+    private fun pickSoundMode() {
+        val modes = Sound.PRESETS.keys.toList()
+        choose("Sound mode", modes, modes.indexOf(Sound.mode(this))) {
+            if (modes[it] == "Custom") customSound()
+            else {
+                Sound.setMode(this, modes[it])
+                showCaption(if (Sound.supported) "Sound: ${modes[it]}" else
+                    "Sound: ${modes[it]} (not available for this audio track — try the AAC/stereo track)", 3000)
+            }
+        }
+    }
+
+    private fun customSound() {
+        val c = Sound.custom(this)
+        val names = listOf("Bass", "Low mid", "Mid (voices)", "High mid", "Treble")
+        val rows = names.mapIndexed { i, n -> Triple(n, c.gains[i] + 12, 24) } + Triple("Loudness boost", c.boost, 12)
+        sliders("Custom sound (dB)", rows) { v ->
+            Sound.setCustom(this, Sound.Preset(v.take(5).map { it - 12 }, v[5]))
+        }
+    }
+
+    private fun sliders(title: String, rows: List<Triple<String, Int, Int>>, onChange: (List<Int>) -> Unit) {
+        val d = resources.displayMetrics.density
+        val box = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding((24 * d).toInt(), (8 * d).toInt(), (24 * d).toInt(), 0)
+        }
+        val bars = rows.map { (label, value, max) ->
+            val text = TextView(this).apply { setTextColor(0xFFE8EAED.toInt()); textSize = 15f }
+            val bar = android.widget.SeekBar(this).apply {
+                this.max = max
+                progress = value
+                keyProgressIncrement = 1
+                isFocusable = true
+            }
+            box.addView(text); box.addView(bar)
+            Triple(label, text, bar)
+        }
+        fun refresh() {
+            bars.forEachIndexed { i, (label, text, bar) ->
+                val (_, _, max) = rows[i]
+                val shown = when {
+                    title.startsWith("Custom sound") && i < 5 -> "${bar.progress - 12}"
+                    title.startsWith("Custom picture") && i == 1 -> "${bar.progress + 50}%"
+                    title.startsWith("Custom picture") && i == 2 -> "${bar.progress}%"
+                    title.startsWith("Custom picture") -> "${bar.progress - max / 2}"
+                    else -> "${bar.progress}"
+                }
+                text.text = "$label:  $shown"
+            }
+        }
+        refresh()
+        bars.forEach { (_, _, bar) ->
+            bar.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: android.widget.SeekBar, p: Int, fromUser: Boolean) {
+                    refresh()
+                    onChange(bars.map { it.third.progress })
+                }
+                override fun onStartTrackingTouch(s: android.widget.SeekBar) {}
+                override fun onStopTrackingTouch(s: android.widget.SeekBar) {}
+            })
+        }
+        AlertDialog.Builder(this).setTitle(title).setView(box).setPositiveButton("Done", null).show()
+        bars.first().third.requestFocus()
+    }
+
+    /** Closes the player and tells the phone it can stop sharing now. */
+    private fun disconnect() {
+        sayBye()
+        showCaption("Disconnected", 800)
+        finish()
     }
 
     private fun choose(title: String, labels: List<String>, checked: Int, onPick: (Int) -> Unit) {
@@ -535,7 +739,14 @@ class PlayerActivity : AppCompatActivity(), CastController {
             setOnClickListener { onClick() }
         }
         bar.addView(button(R.drawable.ic_aspect, "Screen size") { cycleAspect() }, 0)
+        bar.addView(button(R.drawable.ic_zoom, "Zoom") { cycleZoom() }, 0)
+        bar.addView(button(R.drawable.ic_rotate, "Rotate") { rotate(90) }, 0)
         bar.addView(button(R.drawable.ic_tune, "Options") { showMenu() }, 0)
+    }
+
+    private fun cycleZoom() {
+        val i = ZOOMS.indexOfFirst { it >= zoom - 0.01f }.coerceAtLeast(0)
+        setZoom(ZOOMS[(i + 1) % ZOOMS.size])
     }
 
     // --------------------------------------------------------------- images
@@ -543,11 +754,15 @@ class PlayerActivity : AppCompatActivity(), CastController {
     private fun showImages(r: CastRequest.Images) {
         releasePlayer()
         mode = "images"
+        queue = mutableListOf()
         urls = r.urls
         names = r.names
         playerView.visibility = View.GONE
         image.visibility = View.VISIBLE
+        image.scaleType = ImageView.ScaleType.FIT_CENTER
+        stopSlideshow()
         showImage(r.index)
+        if (r.slideshow) toggleSlideshow()
     }
 
     private fun showImage(i: Int) {
@@ -685,8 +900,20 @@ class PlayerActivity : AppCompatActivity(), CastController {
             "voldown" -> volume(AudioManager.ADJUST_LOWER)
             "mute" -> if (Build.VERSION.SDK_INT >= 23) volume(AudioManager.ADJUST_TOGGLE_MUTE)
             "external" -> openExternal(v?.takeIf { it.isNotEmpty() })
-            "next" -> showImage(index + 1)
-            "prev" -> showImage(index - 1)
+            "next" -> if (mode == "video") skip(1) else showImage(index + 1)
+            "prev" -> if (mode == "video") skip(-1) else showImage(index - 1)
+            "picmode" -> v?.let { m ->
+                Look.setMode(this, m); applyLook(); showCaption("Picture: ${Look.mode(this)}", 1500)
+            }
+            "piccustom" -> v?.split(',')?.mapNotNull { it.trim().toIntOrNull() }?.takeIf { it.size == 4 }?.let {
+                Look.setCustom(this, Look.Params(it[0], it[1], it[2], it[3])); applyLook()
+            }
+            "soundmode" -> v?.let { m -> Sound.setMode(this, m); showCaption("Sound: ${Sound.mode(this)}", 1500) }
+            "soundcustom" -> v?.split(',')?.mapNotNull { it.trim().toIntOrNull() }?.takeIf { it.size == 6 }?.let {
+                Sound.setCustom(this, Sound.Preset(it.take(5), it[5]))
+            }
+            "showpin" -> PairDialog.showIfPending(this)
+            "disconnect" -> disconnect()
             "slideshow" -> toggleSlideshow()
             "rotate" -> rotate(v?.toIntOrNull() ?: 90)
             "zoom" -> when (v) {
@@ -706,12 +933,23 @@ class PlayerActivity : AppCompatActivity(), CastController {
 
     private fun publishStatus() {
         val j = JSONObject().put("mode", mode).put("rotation", rotation).put("zoom", zoom.toDouble())
+            .put("picMode", Look.mode(this)).put("picModes", JSONArray(Look.PRESETS.keys.toList()))
+            .put("picCustom", Look.custom(this).let { JSONArray(listOf(it.brightness, it.contrast, it.saturation, it.warmth)) })
+            .put("soundMode", Sound.mode(this)).put("soundModes", JSONArray(Sound.PRESETS.keys.toList()))
+            .put("soundCustom", Sound.custom(this).let { JSONArray(it.gains + it.boost) })
+            .put("soundOk", Sound.supported)
         when (mode) {
             "video" -> {
                 val p = player
                 val err = p?.playerError?.errorCodeName
+                val c = current
                 j.put("title", title)
                     .put("key", key)
+                    .put("online", c?.online == true)
+                    .put("radio", c?.radio == true)
+                    .put("vpn", c?.online == true && AdBlock.vpnActive(this))
+                    .put("qIndex", p?.currentMediaItemIndex ?: 0)
+                    .put("qCount", queue.size)
                     .put("error", if (reconnecting) "" else err ?: "")
                     .put("reconnecting", reconnecting)
                     .put("playing", p != null && err == null && p.playWhenReady && p.playbackState != Player.STATE_ENDED)
@@ -784,6 +1022,10 @@ class PlayerActivity : AppCompatActivity(), CastController {
                 if (down) showMenu()
                 return true
             }
+            if (event.keyCode == KeyEvent.KEYCODE_MEDIA_NEXT || event.keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS) {
+                if (down) skip(if (event.keyCode == KeyEvent.KEYCODE_MEDIA_NEXT) 1 else -1)
+                return true
+            }
             // With the control bar hidden, left/right on the remote seek 10s directly.
             if (!playerView.isControllerFullyVisible &&
                 (event.keyCode == KeyEvent.KEYCODE_DPAD_LEFT || event.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT)
@@ -805,6 +1047,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         reconnecting = false
+        sayBye()
         io.shutdownNow()
         releasePlayer()
         if (Bus.controller === this) {
