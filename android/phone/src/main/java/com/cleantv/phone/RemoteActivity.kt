@@ -144,7 +144,8 @@ class RemoteActivity : AppCompatActivity() {
         super.onStop()
     }
 
-    private fun isRadio() = last?.optBoolean("radio") == true && RadioQueue.stations.size > 1
+    /** Radio list kept on the phone (stations picked on the TV are stepped through by the TV itself). */
+    private fun isRadio() = last?.optBoolean("radio") == true && (last?.optInt("qCount") ?: 0) <= 1 && RadioQueue.stations.size > 1
 
     /** Next/previous station from the list the station was picked from. */
     private fun stepStation(delta: Int) {
@@ -303,6 +304,10 @@ class RemoteActivity : AppCompatActivity() {
             return
         }
         failures = 0
+        // Keep the phone's copy of the resume position current while watching.
+        if (s.optString("mode") == "video" && s.optString("key").isNotEmpty() && s.optLong("dur") > 0) {
+            Prefs.mergeProgress(this, s.optString("key"), s.optString("title"), s.optLong("pos"), s.optLong("dur"))
+        }
         render(s)
     }
 
@@ -338,7 +343,7 @@ class RemoteActivity : AppCompatActivity() {
                     q > 1 -> "  ·  ${s.optInt("qIndex") + 1} of $q"
                     else -> ""
                 }
-                val radioList = s.optBoolean("radio") && RadioQueue.stations.size > 1
+                val radioList = s.optBoolean("radio") && (q > 1 || RadioQueue.stations.size > 1)
                 queueRow.visibility = if (q > 1 || radioList) View.VISIBLE else View.GONE
                 findViewById<Button>(R.id.btnPrevVideo).text = if (radioList) "⏮ Previous station" else "⏮ Previous"
                 findViewById<Button>(R.id.btnNextVideo).text = if (radioList) "Next station ⏭" else "Next ⏭"

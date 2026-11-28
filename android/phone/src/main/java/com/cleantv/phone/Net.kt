@@ -277,7 +277,7 @@ object TvClient {
         try { JSONObject(it) } catch (e: Exception) { null }
     }
 
-    fun history(tv: Tv): String? = sget(tv, "/history", 1500)
+    fun history(tv: Tv, timeoutMs: Int = 4000): String? = sget(tv, "/history", timeoutMs)
 
     /** Tells the TV where this phone's library lives so it can be browsed from the TV remote. */
     fun hello(tv: Tv, base: String, name: String): Boolean =
@@ -314,6 +314,18 @@ object Prefs {
         .replace("-", "").also { sp(ctx).edit().putString("token", it).apply() }
 
     fun saveHistory(ctx: Context, json: String) = sp(ctx).edit().putString("history", json).apply()
+
+    /** Updates one entry of the cached TV history (moves it to the front), e.g. from the remote's live status. */
+    fun mergeProgress(ctx: Context, key: String, title: String, pos: Long, dur: Long) {
+        val old = try { JSONArray(sp(ctx).getString("history", "[]")) } catch (e: Exception) { JSONArray() }
+        val out = JSONArray().put(JSONObject().put("key", key).put("title", title).put("pos", pos).put("dur", dur)
+            .put("t", System.currentTimeMillis()))
+        for (i in 0 until old.length()) {
+            val o = old.optJSONObject(i) ?: continue
+            if (o.optString("key") != key && out.length() < 50) out.put(o)
+        }
+        sp(ctx).edit().putString("history", out.toString()).apply()
+    }
 
     fun clearHistory(ctx: Context) = sp(ctx).edit().remove("history").remove("links").apply()
 

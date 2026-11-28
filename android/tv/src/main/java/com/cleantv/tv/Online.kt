@@ -38,8 +38,11 @@ object Online {
         return false
     }
 
-    fun radio(ctx: Context, item: VideoItem, vpn: Boolean) {
-        if (vpnReady(ctx, vpn) { v -> radio(ctx, item, v) }) play(ctx, CastRequest.Video(listOf(item), 0, 0))
+    fun radio(ctx: Context, item: VideoItem, vpn: Boolean) = radio(ctx, listOf(item), 0, vpn)
+
+    /** Station list picked on the TV: ◀ ▶ / ⏮ ⏭ in the player step through it. */
+    fun radio(ctx: Context, items: List<VideoItem>, index: Int, vpn: Boolean) {
+        if (vpnReady(ctx, vpn) { v -> radio(ctx, items, index, v) }) play(ctx, CastRequest.Video(items, index, 0))
     }
 
     /** Google Photos album whose picture list the phone already read: slideshow, videos played in place. */

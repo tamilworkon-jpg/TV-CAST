@@ -49,7 +49,11 @@ object History {
             if (o.optString("key") != key && out.length() < MAX) out.put(o)
         }
         sp(ctx).edit().putString("items", out.toString()).apply()
+        changed()
     }
+
+    /** Lets the home screen refresh its "Continue" row and progress bars right away. */
+    private fun changed() { Bus.main.post { Bus.onHistoryChanged?.invoke() } }
 
     @Synchronized
     fun find(ctx: Context, key: String): JSONObject? {
@@ -62,11 +66,13 @@ object History {
     @Synchronized
     fun clear(ctx: Context) {
         sp(ctx).edit().clear().apply()
+        changed()
     }
 }
 
 /** Wipes play history and any cached files (images, player temp data). */
 fun clearAll(ctx: Context) {
     History.clear(ctx)
+    Radio.clearRecent(ctx)
     ctx.cacheDir.listFiles()?.forEach { it.deleteRecursively() }
 }

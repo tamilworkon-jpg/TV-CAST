@@ -42,6 +42,8 @@ object Bus {
     @Volatile var controller: CastController? = null
     @Volatile var status: String = IDLE
     @Volatile var onPhoneChanged: (() -> Unit)? = null
+    /** Play history was updated (position saved, cleared). */
+    @Volatile var onHistoryChanged: (() -> Unit)? = null
     @Volatile var onPaired: (() -> Unit)? = null
     @Volatile var onPairRequest: (() -> Unit)? = null
     /** Re-runs the link/radio request after the VPN permission prompt (argument: VPN allowed). */

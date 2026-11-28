@@ -161,14 +161,19 @@ class CastServer(private val ctx: Context) : NanoHTTPD(PORT) {
             // Online link: resolved off the request thread (may need to load a web page first).
             val j = JSONObject(body)
             val url = safeUrl(j.getString("url"))
-            worker.execute { Online.open(ctx, url, j.optString("title"), j.optBoolean("vpn", true)) }
+            val vpn = j.optBoolean("vpn", true)
+            Radio.rememberVpn(ctx, vpn)
+            worker.execute { Online.open(ctx, url, j.optString("title"), vpn) }
             ok()
         }
         "/radio" -> {
             val j = JSONObject(body)
             val item = VideoItem(safeUrl(j.getString("url")), j.optString("name", "Radio"), online = true, radio = true,
                 artwork = j.optString("favicon").takeIf { it.startsWith("http") })
-            worker.execute { Online.radio(ctx, item, j.optBoolean("vpn", true)) }
+            val vpn = j.optBoolean("vpn", true)
+            Radio.rememberVpn(ctx, vpn)
+            Radio.remember(ctx, Station(item.title, item.url, item.artwork))
+            worker.execute { Online.radio(ctx, item, vpn) }
             ok()
         }
         "/vpn" -> {

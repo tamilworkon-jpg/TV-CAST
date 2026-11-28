@@ -60,6 +60,11 @@
             android:text="Pictures" />
 
         <TextView
+            android:id="@+id/tabRadio"
+            style="@style/Tab"
+            android:text="Radio" />
+
+        <TextView
             android:id="@+id/btnRefresh"
             style="@style/Tab"
             android:text="Refresh" />

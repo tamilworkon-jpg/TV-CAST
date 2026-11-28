@@ -691,6 +691,10 @@ class MainActivity : AppCompatActivity() {
 
     /** Returns the start position (0 = beginning), or null if the user cancelled. */
     private suspend fun askResume(item: Media): Long? {
+        // Ask the TV for the latest position first (it may have been watched from the TV remote since).
+        Prefs.lastTv(this)?.takeIf { it.paired }?.let { tv ->
+            withContext(Dispatchers.IO) { TvClient.history(tv, 1500) }?.let { Prefs.saveHistory(this, it); history = Prefs.history(this) }
+        }
         val p = history[item.key]
         if (p == null || !p.resumable) return 0L
         return suspendCancellableCoroutine { cont ->
