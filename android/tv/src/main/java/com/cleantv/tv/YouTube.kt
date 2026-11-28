@@ -39,7 +39,7 @@ object YouTube {
     /** Canonical watch link (the TV's YouTube app only understands this form). */
     fun watchUrl(link: String): String? = videoId(link)?.let { "https://www.youtube.com/watch?v=$it" }
 
-    /** Resolves a YouTube link to an HLS stream ExoPlayer can play, or null. Blocking; call off the main thread. */
+    /** Resolves a YouTube link to an HLS stream the player can play, or null. Blocking; call off the main thread. */
     fun resolve(link: String): VideoItem? {
         val id = videoId(link) ?: return null
         val visitor = post("https://www.youtube.com/youtubei/v1/visitor_id?prettyPrint=false", context(null))

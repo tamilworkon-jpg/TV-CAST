@@ -100,6 +100,26 @@ object Sound {
         }
     }
 
+    /** Same sound modes for the built-in VLC engine (its own 10-band equalizer; works for every audio format). */
+    fun vlcEqualizer(ctx: Context): org.videolan.libvlc.MediaPlayer.Equalizer? {
+        val p = current(ctx)
+        if (p.gains.all { it == 0 } && p.boost == 0) return null
+        val eq = org.videolan.libvlc.MediaPlayer.Equalizer.create()
+        for (b in 0 until org.videolan.libvlc.MediaPlayer.Equalizer.getBandCount()) {
+            val hz = org.videolan.libvlc.MediaPlayer.Equalizer.getBandFrequency(b)
+            val region = when {
+                hz < 150 -> 0
+                hz < 500 -> 1
+                hz < 2000 -> 2
+                hz < 6000 -> 3
+                else -> 4
+            }
+            eq.setAmp(b, p.gains[region].toFloat())
+        }
+        eq.setPreAmp(p.boost.toFloat())
+        return eq
+    }
+
     fun release() {
         runCatching { eq?.release() }
         runCatching { loud?.release() }

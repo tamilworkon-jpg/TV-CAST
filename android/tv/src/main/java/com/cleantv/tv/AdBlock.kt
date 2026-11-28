@@ -3,23 +3,12 @@ package com.cleantv.tv
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
-import androidx.annotation.OptIn
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.DataSource
-import androidx.media3.datasource.DataSpec
-import androidx.media3.datasource.DefaultDataSource
-import androidx.media3.datasource.DefaultHttpDataSource
-import androidx.media3.datasource.HttpDataSource
-import androidx.media3.datasource.ResolvingDataSource
-import java.io.IOException
 
 /**
- * Built-in ad / tracker blocker for everything the player downloads.
- * Requests to known ad and tracking hosts are refused before any connection is made.
+ * Built-in ad / tracker blocker: links to known ad and tracking hosts are refused before anything is played.
  * (Direct video links and HLS/DASH streams have no ads of their own; this stops ad
  * and tracking beacons that some streams and pages embed.)
  */
-@OptIn(UnstableApi::class)
 object AdBlock {
     private val BLOCKED = listOf(
         "doubleclick.net", "googlesyndication.com", "googleadservices.com", "adservice.google.com",
@@ -40,26 +29,6 @@ object AdBlock {
     fun isBlocked(host: String?): Boolean {
         val h = host?.lowercase()?.trimEnd('.') ?: return false
         return BLOCKED.any { h == it || h.endsWith(".$it") }
-    }
-
-    fun dataSourceFactory(ctx: Context): DataSource.Factory {
-        val http = DefaultHttpDataSource.Factory()
-            .setUserAgent("Mozilla/5.0 (Linux; Android 9; AFT) TVCast/2")
-            .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(10_000)
-            .setReadTimeoutMs(15_000)
-        val upstream = DefaultDataSource.Factory(ctx, http)
-        return ResolvingDataSource.Factory(upstream) { spec: DataSpec ->
-            if (isBlocked(spec.uri.host)) {
-                blockedCount++
-                throw HttpDataSource.HttpDataSourceException(
-                    IOException("blocked ad/tracker host"), spec,
-                    androidx.media3.common.PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
-                    HttpDataSource.HttpDataSourceException.TYPE_OPEN,
-                )
-            }
-            spec
-        }
     }
 
     /** True when a VPN app on the TV (e.g. Proton VPN) is active; all playback traffic then goes through it. */

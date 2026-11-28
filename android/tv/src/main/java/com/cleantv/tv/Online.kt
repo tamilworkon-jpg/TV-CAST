@@ -107,7 +107,7 @@ object Online {
     }
 
     /**
-     * Returns a URL ExoPlayer can play. Direct media is returned as-is; for web pages the
+     * Returns a URL the player can play. Direct media is returned as-is; for web pages the
      * page is read once (in memory only) and the first video/stream link on it is used.
      */
     private fun findPlayable(url: String): String? {

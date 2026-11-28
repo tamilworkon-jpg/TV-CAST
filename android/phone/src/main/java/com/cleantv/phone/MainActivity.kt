@@ -184,6 +184,32 @@ class MainActivity : AppCompatActivity() {
         if (hasMediaPermission()) loadMedia()
         refreshHistory()
         refreshVpnTile()
+        startHistoryPoll()
+    }
+
+    override fun onPause() {
+        historyPoll?.cancel()
+        historyPoll = null
+        super.onPause()
+    }
+
+    private var batteryAskedThisRun = false
+    private var historyPoll: Job? = null
+
+    /** While this screen is open, keep resume positions in step with the TV (videos watched from the TV remote too). */
+    private fun startHistoryPoll() {
+        historyPoll?.cancel()
+        historyPoll = lifecycleScope.launch {
+            while (true) {
+                delay(15_000)
+                val tv = Prefs.lastTv(this@MainActivity)?.takeIf { it.paired } ?: continue
+                val json = withContext(Dispatchers.IO) { TvClient.history(tv, 2500) } ?: continue
+                if (json != Prefs.historyJson(this@MainActivity)) {
+                    Prefs.saveHistory(this@MainActivity, json)
+                    applyHistory()
+                }
+            }
+        }
     }
 
     /** Reconnects to the TV (following IP changes) and pulls resume positions. No sharing is started. */
@@ -479,26 +505,35 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * vivo/Funtouch kills background apps on a locked phone, which would stop the TV mid-movie.
-     * Ask once to exempt TV Cast from battery optimisation.
+     * A locked phone lying still goes into Android's deep sleep ("Doze"): the TV Cast sharing service is
+     * frozen and a long movie stops on the TV until the phone is unlocked. Only apps without battery
+     * restrictions keep running. Asked at first start, and again (once per app start) when sending a
+     * video, until allowed or "Don't ask again".
      */
     @android.annotation.SuppressLint("BatteryLife")
-    private fun maybeAskBattery() {
+    private fun maybeAskBattery(whenPlaying: Boolean = false) {
         val pm = getSystemService(android.os.PowerManager::class.java)
-        if (pm.isIgnoringBatteryOptimizations(packageName) || Prefs.getFlag(this, "asked_battery")) return
+        if (pm.isIgnoringBatteryOptimizations(packageName) || Prefs.getFlag(this, "battery_never")) return
+        if (whenPlaying) { if (batteryAskedThisRun) return } else if (Prefs.getFlag(this, "asked_battery")) return
+        batteryAskedThisRun = true
         Prefs.setFlag(this, "asked_battery")
         AlertDialog.Builder(this)
             .setTitle("Keep playing when the phone is locked")
             .setMessage(
-                "So the TV doesn't stop when your phone screen turns off, allow TV Cast to run without battery restrictions.\n\n" +
-                    "On vivo also check: Settings → Battery → Background power consumption → TV Cast → Allow."
+                "Right now Android pauses TV Cast when your phone is locked, so long videos stop on the TV " +
+                    "until you unlock the phone.\n\nTap Allow, then choose \"Allow\" / \"Don't optimise\" for TV Cast.\n\n" +
+                    "On vivo / Xiaomi / Oppo also check: Settings → Battery → Background power consumption " +
+                    "(or App battery saver) → TV Cast → Allow / No restrictions."
             )
             .setPositiveButton("Allow") { _, _ ->
                 runCatching {
                     startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                }.onFailure {
+                    runCatching { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
                 }
             }
-            .setNegativeButton("Later", null)
+            .setNegativeButton("Not now", null)
+            .setNeutralButton("Don't ask again") { _, _ -> Prefs.setFlag(this, "battery_never") }
             .show()
     }
 
@@ -630,6 +665,7 @@ class MainActivity : AppCompatActivity() {
             toast("Phone is not on Wi-Fi or hotspot")
             return false
         }
+        maybeAskBattery(whenPlaying = true)
         if (!ServerService.running) {
             ServerService.start(this)
             repeat(20) { if (!ServerService.running) delay(100) }

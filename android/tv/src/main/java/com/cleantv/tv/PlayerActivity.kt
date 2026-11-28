@@ -8,45 +8,59 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.KeyEvent
+import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.ImageButton
 import android.widget.ImageView
+import android.widget.ProgressBar
+import android.widget.SeekBar
 import android.widget.TextView
-import androidx.annotation.OptIn
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.media3.common.AudioAttributes
-import androidx.media3.common.C
-import androidx.media3.common.Format
-import androidx.media3.common.MediaItem
-import androidx.media3.common.MediaMetadata
-import androidx.media3.common.MimeTypes
-import androidx.media3.common.PlaybackException
-import androidx.media3.common.Player
-import androidx.media3.common.TrackSelectionOverride
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.exoplayer.DefaultRenderersFactory
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.SeekParameters
-import androidx.media3.exoplayer.audio.AudioCapabilities
-import androidx.media3.exoplayer.audio.AudioSink
-import androidx.media3.exoplayer.audio.DefaultAudioSink
-import androidx.media3.ui.AspectRatioFrameLayout
-import androidx.media3.ui.PlayerView
 import coil.load
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.Locale
+import org.videolan.libvlc.LibVLC
+import org.videolan.libvlc.Media
+import org.videolan.libvlc.MediaPlayer
+import org.videolan.libvlc.interfaces.IMedia
+import org.videolan.libvlc.util.VLCVideoLayout
 
-@OptIn(UnstableApi::class)
+/**
+ * Full-screen player. Videos, links, radio and album videos play on the built-in VLC engine
+ * (libVLC): every common container and codec — MKV, MP4, HEVC/H.264, AC3/E-AC3, DTS, TrueHD,
+ * AAC, FLAC… — with hardware video decoding drawn straight to the screen for full HD/4K quality.
+ * Pictures are shown with Coil.
+ */
 class PlayerActivity : AppCompatActivity(), CastController {
-    private lateinit var playerView: PlayerView
+    private lateinit var videoLayout: VLCVideoLayout
     private lateinit var image: ImageView
     private lateinit var caption: TextView
+    private lateinit var spinner: ProgressBar
+    private lateinit var controls: View
+    private lateinit var ctlTitle: TextView
+    private lateinit var ctlInfo: TextView
+    private lateinit var ctlPos: TextView
+    private lateinit var ctlDur: TextView
+    private lateinit var ctlSeek: SeekBar
+    private lateinit var ctlSeekRow: View
+    private lateinit var btnPrev: ImageButton
+    private lateinit var btnRew: ImageButton
+    private lateinit var btnPlay: ImageButton
+    private lateinit var btnFwd: ImageButton
+    private lateinit var btnNext: ImageButton
+    private lateinit var btnAudio: TextView
+    private lateinit var btnSubs: TextView
+    private lateinit var btnSpeed: TextView
+    private lateinit var btnAspect: TextView
     private lateinit var audio: AudioManager
-    private var player: ExoPlayer? = null
+
+    private var libVlc: LibVLC? = null
+    private var mp: MediaPlayer? = null
+    /** Video drawn on a TextureView (needed for picture modes / rotate / zoom) instead of the faster SurfaceView. */
+    private var textureMode = false
 
     private var mode = "idle"
     private var title = ""
@@ -62,30 +76,54 @@ class PlayerActivity : AppCompatActivity(), CastController {
     private var ticks = 0
     private var cachedPlayers: List<Pair<String, String>> = emptyList()
     private var reconnecting = false
+    private var reconnectAttempts = 0
     /** The Android VPN permission prompt is open over this screen. */
     private var awaitingVpn = false
     private var queue: MutableList<VideoItem> = mutableListOf()
+    private var qIndex = 0
     private var rotation = 0
     private var zoom = 1f
     private var panX = 0f
     private var panY = 0f
     private var reconnectStartedAt = 0L
     private var resumeAt = 0L
-    /** Dolby/DTS audio is sent untouched to the TV/soundbar. Off while playing faster/slower (see [setSpeed]). */
-    private var audioPassthrough = true
-    /** After switching to decoded audio for a speed change: check the audio could actually be decoded. */
-    private var checkDecodedAudio = false
+    private var speed = 1f
+    private var ended = false
+    private var errorText = ""
+    private var buffering = false
+    /** Length of the current item (ms), 0 = unknown / live. */
+    private var length = 0L
+    /** Last known play position; VLC reports 0 after an error or the end, so this is kept separately. */
+    private var lastTime = 0L
+    /** The current item has started playing once (subtitles/delays applied). */
+    private var started = false
     /** Where repeated ⏩/⏪ presses are heading; the real seek happens once the presses stop. */
     private var seekTarget = -1L
-    /** Duration of the current queue entry, kept so the entry can be marked watched after it moves on. */
-    private var lastDur = 0L
     /** Stations in a row that failed to play; stops trying once every station has been tried. */
     private var radioFails = 0
+    /** When the current stall (buffering with no progress) began; 0 = not stalled. */
+    private var stallSince = 0L
+    /** Last time the stall watchdog restarted the stream. */
+    private var lastStallFix = 0L
+    private var stallTime = -1L
+    private var backAt = 0L
+    /** The video was handed to another player app: don't tell the phone to stop sharing. */
+    private var handedOff = false
     private val io = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val prefs by lazy { getSharedPreferences("player", MODE_PRIVATE) }
 
     private val handler = Handler(Looper.getMainLooper())
     private val ticker = object : Runnable {
         override fun run() {
+            mp?.let { p ->
+                val t = p.time
+                if (mode == "video" && p.isPlaying && t > 0) {
+                    lastTime = t
+                    if (t > resumeAt + 10_000) reconnectAttempts = 0
+                }
+            }
+            checkStall()
+            if (controls.visibility == View.VISIBLE) updateControls()
             publishStatus()
             if (++ticks % 4 == 0) saveProgress()
             if (ticks % 2 == 0) PairDialog.showIfPending(this@PlayerActivity)
@@ -108,32 +146,42 @@ class PlayerActivity : AppCompatActivity(), CastController {
     /** Ignores video checks that finish after the slideshow has moved on. */
     private var videoCheck = 0
     private val hideCaption = Runnable { caption.visibility = View.GONE }
-    private val closeIfEnded = Runnable { if (player?.playbackState == Player.STATE_ENDED) finish() }
+    private val closeIfEnded = Runnable { if (ended) finish() }
+    private val hideControls = Runnable {
+        // Paused: keep the bar up so it's clear what's going on.
+        if (mp?.isPlaying == true || current?.radio == true) controls.visibility = View.GONE else scheduleHide()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_player)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        playerView = findViewById(R.id.playerView)
+        videoLayout = findViewById(R.id.videoLayout)
         image = findViewById(R.id.image)
         caption = findViewById(R.id.caption)
+        spinner = findViewById(R.id.spinner)
+        controls = findViewById(R.id.controls)
+        ctlTitle = findViewById(R.id.ctlTitle)
+        ctlInfo = findViewById(R.id.ctlInfo)
+        ctlPos = findViewById(R.id.ctlPos)
+        ctlDur = findViewById(R.id.ctlDur)
+        ctlSeek = findViewById(R.id.ctlSeek)
+        ctlSeekRow = findViewById(R.id.ctlSeekRow)
+        btnPrev = findViewById(R.id.btnPrev)
+        btnRew = findViewById(R.id.btnRew)
+        btnPlay = findViewById(R.id.btnPlay)
+        btnFwd = findViewById(R.id.btnFwd)
+        btnNext = findViewById(R.id.btnNext)
+        btnAudio = findViewById(R.id.btnAudio)
+        btnSubs = findViewById(R.id.btnSubs)
+        btnSpeed = findViewById(R.id.btnSpeed)
+        btnAspect = findViewById(R.id.btnAspect)
         audio = getSystemService(AUDIO_SERVICE) as AudioManager
         cachedPlayers = externalPlayers(this)
-        addControllerButtons()
-        // Video size / layout changes resize the surface, so the rotation fit must be recomputed.
-        val relayout = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyTransform() }
-        (playerView.videoSurfaceView as? View)?.let { surface ->
-            surface.addOnLayoutChangeListener(relayout)
-            // The content frame is sized to the video's shape; let a rotated/zoomed video draw outside it.
-            var p = surface.parent as? ViewGroup
-            while (p != null) {
-                p.clipChildren = false
-                p.clipToPadding = false
-                if (p === playerView) break
-                p = p.parent as? ViewGroup
-            }
-        }
-        image.addOnLayoutChangeListener(relayout)
+        aspect = prefs.getInt("aspect", 0).coerceIn(0, ASPECTS.size - 1)
+        setupControls()
+        image.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyTransform() }
+        videoLayout.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyTransform() }
         applyLook()
         Bus.controller = this
         handleRequest()
@@ -196,73 +244,193 @@ class PlayerActivity : AppCompatActivity(), CastController {
         }
     }
 
+    // ---------------------------------------------------------------- VLC engine
+
+    private fun vlcOptions() = arrayListOf(
+        "--network-caching=3000",       // phone over Wi-Fi: rides out short drops, still quick to start/seek
+        "--prefetch-buffer-size=49152", // read up to 48 MB ahead, so a phone that briefly sleeps doesn't stall the film
+        "--prefetch-read-size=1048576",
+        "--http-reconnect",             // resume a dropped HTTP connection instead of ending the video
+        "--audio-time-stretch",         // faster/slower playback keeps the normal voice pitch
+        "--audio-resampler=soxr",       // best-quality resampling
+        "--avcodec-skiploopfilter=0",   // never trade picture quality for speed in software decoding
+        "--subsdec-encoding=UTF-8",
+        "--freetype-rel-fontsize=16",
+        "--no-stats",
+    )
+
+    /** Creates the engine on first use and attaches it to the screen. */
+    private fun vlc(): MediaPlayer {
+        mp?.let { return it }
+        val lib = libVlc ?: LibVLC(applicationContext, vlcOptions()).also { libVlc = it }
+        val p = MediaPlayer(lib)
+        p.setEventListener { e ->
+            if (Looper.myLooper() == Looper.getMainLooper()) onVlcEvent(e) else handler.post { onVlcEvent(e) }
+        }
+        // Dolby/DTS: decoded on the TV (works with every TV/soundbar) unless passthrough is chosen in ☰.
+        p.setAudioDigitalOutputEnabled(prefs.getBoolean("passthrough", false))
+        mp = p
+        textureMode = needTexture()
+        p.attachViews(videoLayout, null, true, textureMode)
+        afterAttach()
+        p.videoScale = ASPECTS[aspect].first
+        applySound()
+        return p
+    }
+
+    private fun releaseVlc() {
+        saveProgress()
+        mp?.let { p ->
+            p.setEventListener(null)
+            runCatching { p.stop() }
+            runCatching { p.detachViews() }
+            p.release()
+        }
+        mp = null
+        libVlc?.release()
+        libVlc = null
+    }
+
+    /** TextureView only when picture mode, rotation or zoom need it; SurfaceView is faster and sharper otherwise. */
+    private fun needTexture(): Boolean = Look.filter(this) != null || rotation != 0 || zoom != 1f
+
+    private fun ensureSurface() {
+        val p = mp ?: return
+        val need = needTexture()
+        if (need == textureMode) return
+        textureMode = need
+        p.detachViews()
+        p.attachViews(videoLayout, null, true, textureMode)
+        afterAttach()
+        p.videoScale = ASPECTS[aspect].first
+    }
+
+    private fun afterAttach() {
+        // A rotated/zoomed video must be allowed to draw outside its frame.
+        fun open(g: ViewGroup) {
+            g.clipChildren = false
+            g.clipToPadding = false
+            for (i in 0 until g.childCount) (g.getChildAt(i) as? ViewGroup)?.let { open(it) }
+        }
+        open(videoLayout)
+        handler.post { applyLook(); applyTransform() }
+    }
+
+    private fun textureView(): TextureView? {
+        fun find(v: View): TextureView? {
+            if (v is TextureView) return v
+            if (v is ViewGroup) for (i in 0 until v.childCount) find(v.getChildAt(i))?.let { return it }
+            return null
+        }
+        return if (textureMode) find(videoLayout) else null
+    }
+
+    private fun onVlcEvent(e: MediaPlayer.Event) {
+        if (mp == null || isFinishing) return
+        when (e.type) {
+            MediaPlayer.Event.Playing -> {
+                buffering = false
+                spinner.visibility = View.GONE
+                errorText = ""
+                radioFails = 0
+                if (reconnecting) {
+                    reconnecting = false
+                    handler.removeCallbacks(reconnectStep)
+                }
+                if (!started) onStarted()
+            }
+            MediaPlayer.Event.Buffering -> {
+                buffering = e.buffering < 100f
+                spinner.visibility = if (buffering && mode == "video" && current?.radio != true) View.VISIBLE else View.GONE
+            }
+            MediaPlayer.Event.LengthChanged -> length = e.lengthChanged
+            MediaPlayer.Event.EndReached -> onEnded()
+            MediaPlayer.Event.EncounteredError -> onError()
+            MediaPlayer.Event.ESAdded, MediaPlayer.Event.ESSelected -> {
+                val p = mp ?: return
+                if (!subsOn && p.spuTrack != -1) p.setSpuTrack(-1)
+                if (controls.visibility == View.VISIBLE) updateControls()
+            }
+            MediaPlayer.Event.Vout -> handler.post { applyLook(); applyTransform() }
+        }
+    }
+
+    /** First "playing" of an item: external subtitles, sync offsets, speed. */
+    private fun onStarted() {
+        val p = mp ?: return
+        started = true
+        if (mode != "video") return
+        subUrl?.let { p.addSlave(IMedia.Slave.Type.Subtitle, Uri.parse(it), subsOn) }
+        p.setAudioDelay(prefs.getLong("audioDelay", 0) * 1000)
+        p.setSpuDelay(prefs.getLong("subDelay", 0) * 1000)
+        if (speed != 1f && current?.radio != true) p.rate = speed
+    }
+
     // ---------------------------------------------------------------- video
 
     private fun playVideo(r: CastRequest.Video) {
         saveProgress()
         stopSlideshow()
+        slideVideo = false
         mode = "video"
         queue = r.items.toMutableList()
         image.visibility = View.GONE
-        playerView.visibility = View.VISIBLE
-        // A new video starts at normal speed, so its surround sound goes straight to the TV/soundbar again.
-        if (!audioPassthrough) { releasePlayer(); audioPassthrough = true }
-        handler.removeCallbacks(doSeek)
-        seekTarget = -1L
-        val p = player ?: createPlayer()
-        resetView()
+        videoLayout.visibility = View.VISIBLE
         reconnecting = false
+        reconnectAttempts = 0
         handler.removeCallbacks(reconnectStep)
         handler.removeCallbacks(closeIfEnded)
-        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon().clearOverrides().build()
-        p.setPlaybackSpeed(1f)
-        p.setMediaItems(queue.map { buildItem(it) }, r.index, r.startMs.coerceAtLeast(0))
-        p.prepare()
-        p.playWhenReady = true
-        syncCurrent()
+        handler.removeCallbacks(doSeek)
+        seekTarget = -1L
+        speed = 1f
+        rotation = 0; zoom = 1f; panX = 0f; panY = 0f
+        startItem(r.index, r.startMs)
         val c = current ?: return
         val hint = when {
             c.radio -> "Live radio" + (if (r.items.size > 1) " · ◀ ▶ or ⏮ ⏭ for other stations" else "") + " · ☰ for sound modes"
             c.online -> "Private mode: nothing about this link is saved · ☰ for options"
-            else -> "☰ for audio, subtitles, picture & sound modes, rotate, zoom, VLC/MX"
+            else -> "OK for controls · ◀ ▶ to skip · ☰ for audio, subtitles, sync, picture & sound"
         }
-        val next = if (queue.size > 1 && !c.radio) "\n${r.index + 1} of ${queue.size} · ⏭ for next video" else ""
+        val next = if (queue.size > 1 && !c.radio) "\n${qIndex + 1} of ${queue.size} · ⏭ for next video" else ""
         showCaption((if (r.startMs > 0) "${c.title}\nResuming from ${fmt(r.startMs)}" else c.title) + next + "\n$hint", 5000)
     }
 
-    private fun buildItem(v: VideoItem): MediaItem {
-        val item = MediaItem.Builder()
-            .setUri(v.url)
-            .setMediaId(v.key)
-            .setMediaMetadata(MediaMetadata.Builder().setTitle(v.title).build())
-        val path = Uri.parse(v.url).path.orEmpty().lowercase()
-        if (path.endsWith(".m3u8") || v.hls) item.setMimeType(MimeTypes.APPLICATION_M3U8)
-        if (path.endsWith(".mpd")) item.setMimeType(MimeTypes.APPLICATION_MPD)
-        v.sub?.let { sub ->
-            val mime = if (sub.endsWith(".vtt")) MimeTypes.TEXT_VTT else MimeTypes.APPLICATION_SUBRIP
-            item.setSubtitleConfigurations(
-                listOf(
-                    MediaItem.SubtitleConfiguration.Builder(Uri.parse(sub))
-                        .setMimeType(mime)
-                        .setLanguage("en")
-                        .setLabel("External (.${sub.substringAfterLast('.')})")
-                        .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
-                        .build()
-                )
-            )
-        }
-        return item.build()
+    /** Starts queue entry [i] at [startMs]. */
+    private fun startItem(i: Int, startMs: Long) {
+        if (queue.isEmpty()) return
+        val p = vlc()
+        ensureSurface()
+        qIndex = i.coerceIn(0, queue.size - 1)
+        val v = queue[qIndex]
+        syncCurrent()
+        ended = false
+        errorText = ""
+        length = 0L
+        lastTime = startMs.coerceAtLeast(0)
+        resumeAt = lastTime
+        started = false
+        buffering = true
+        spinner.visibility = if (v.radio) View.GONE else View.VISIBLE
+        handler.removeCallbacks(closeIfEnded)
+        val m = Media(libVlc, Uri.parse(v.url))
+        m.setHWDecoderEnabled(true, false)
+        m.addOption(":http-user-agent=Mozilla/5.0 (Linux; Android 9; AFT) TVCast/2")
+        if (v.online) m.addOption(":network-caching=3000")
+        if (startMs > 0) m.addOption(":start-time=${startMs / 1000.0}")
+        p.media = m
+        m.release()
+        p.play()
+        if (controls.visibility == View.VISIBLE) updateControls()
     }
 
     /** Current queue entry. */
-    private val current: VideoItem? get() = queue.getOrNull(player?.currentMediaItemIndex ?: 0)
+    private val current: VideoItem? get() = queue.getOrNull(qIndex)
 
     /** Mirrors the current queue entry into title/key/videoUrl/subUrl. */
     private fun syncCurrent() {
         val c = current ?: return
         title = c.title
         key = if (c.online) "" else c.key // private mode: online links never reach History
-        lastDur = 0L
         videoUrl = c.url
         subUrl = c.sub
         radioView(c)
@@ -271,36 +439,95 @@ class PlayerActivity : AppCompatActivity(), CastController {
     /** Live radio: show the station logo instead of an empty video area. */
     private fun radioView(c: VideoItem) {
         if (!c.radio) {
-            image.visibility = View.GONE
-            playerView.controllerShowTimeoutMs = 5000
+            if (mode == "video") image.visibility = View.GONE
             return
         }
         image.visibility = View.VISIBLE
         image.scaleType = ImageView.ScaleType.CENTER_INSIDE
         if (c.artwork != null) image.load(c.artwork, imageLoader(this)) { error(R.drawable.ic_launcher) }
         else image.setImageResource(R.drawable.ic_launcher)
-        // Bar hides after a while so ◀ ▶ switch stations; any other key brings it back.
-        playerView.controllerShowTimeoutMs = 6000
-        playerView.showController()
+        showControls(btnPlay)
+    }
+
+    /** Resume point saved for [v], if it was half watched. */
+    private fun resumeFor(v: VideoItem): Long {
+        if (v.online) return 0L
+        val h = History.find(this, v.key) ?: return 0L
+        val pos = h.optLong("pos")
+        val dur = h.optLong("dur")
+        return if (pos > 10_000 && dur > 0 && pos < dur - 30_000) pos else 0L
+    }
+
+    /** Moves to queue entry [i], continuing where it was left. */
+    private fun goTo(i: Int) {
+        val v = queue.getOrNull(i) ?: return
+        if (v.radio) {
+            startItem(i, 0)
+            showCaption("${v.title}  (${i + 1} of ${queue.size})", 3000)
+            return
+        }
+        val pos = resumeFor(v)
+        startItem(i, pos)
+        val n = "(${i + 1} of ${queue.size})"
+        showCaption(if (pos > 0) "${v.title}\nResumed from ${fmt(pos)}  $n" else "${v.title}  $n", 3500)
     }
 
     private fun skip(dir: Int) {
-        val p = player ?: return
-        if (queue.size < 2) { showCaption(if (current?.radio == true) "No other stations in this list" else "No other videos in this list", 1500); return }
-        if (current?.radio == true) {
-            // Stations wrap around, like a radio dial.
-            val n = queue.size
-            p.seekTo(((p.currentMediaItemIndex + dir) % n + n) % n, C.TIME_UNSET)
-            p.prepare()
-            p.play()
+        if (queue.size < 2) {
+            showCaption(if (current?.radio == true) "No other stations in this list" else "No other videos in this list", 1500)
             return
         }
         saveProgress()
-        if (dir > 0) {
-            if (p.hasNextMediaItem()) p.seekToNextMediaItem() else showCaption("This is the last video", 1500)
-        } else {
-            if (p.hasPreviousMediaItem()) p.seekToPreviousMediaItem() else p.seekTo(0)
+        handler.removeCallbacks(doSeek)
+        seekTarget = -1L
+        val n = queue.size
+        if (current?.radio == true) { goTo(((qIndex + dir) % n + n) % n); return } // stations wrap around like a dial
+        when {
+            dir > 0 && qIndex + 1 < n -> goTo(qIndex + 1)
+            dir > 0 -> showCaption("This is the last video", 1500)
+            qIndex > 0 -> goTo(qIndex - 1)
+            else -> mp?.setTime(0)
         }
+    }
+
+    private fun onEnded() {
+        if (mode == "images") { endSlideVideo(advance = true); return }
+        if (mode != "video") return
+        val c = current ?: return
+        // A phone video that stops well before its end: the connection dropped, not the film.
+        if (!c.online && length > 0 && lastTime in 1 until length - 15_000) { startReconnect(); return }
+        if (c.radio) { onError(); return }
+        if (key.isNotEmpty() && length > 0) History.save(applicationContext, key, title, length, length)
+        if (qIndex + 1 < queue.size) { goTo(qIndex + 1); return }
+        ended = true
+        showControls(btnPlay)
+        showCaption("Finished. Closing in 10 seconds…", 10_000)
+        handler.postDelayed(closeIfEnded, 10_000)
+    }
+
+    private fun onError() {
+        spinner.visibility = View.GONE
+        if (mode == "images") {
+            showCaption("Couldn't play this video, skipping", 3000)
+            endSlideVideo(advance = true)
+            return
+        }
+        if (mode != "video") return
+        val c = current ?: return
+        if (c.radio && queue.size > 1 && ++radioFails < queue.size) {
+            // Dead station: move on to the next one after a moment.
+            errorText = "unavailable"
+            showCaption("${c.title} isn't on air right now, trying the next station…", 4000)
+            handler.postDelayed({ if (current?.radio == true && errorText.isNotEmpty()) skip(1) }, 2500)
+            return
+        }
+        if (!c.online && !reconnecting) { startReconnect(); return }
+        if (reconnecting) return
+        errorText = "cannot play"
+        showCaption(
+            if (c.radio) "${c.title} isn't on air right now."
+            else "Can't play this link.\nIt may need a website login, or it isn't a direct video/stream link.", 15_000
+        )
     }
 
     /** "http://ip:8090/<token>" part of the current phone media URL; used for keep-alive and reconnect. */
@@ -349,7 +576,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
         if (reconnecting) return
         reconnecting = true
         reconnectStartedAt = System.currentTimeMillis()
-        resumeAt = player?.currentPosition ?: resumeAt
+        resumeAt = if (lastTime > 0) lastTime else resumeAt
         saveProgress()
         handler.removeCallbacks(reconnectStep)
         handler.postDelayed(reconnectStep, 2000)
@@ -358,30 +585,32 @@ class PlayerActivity : AppCompatActivity(), CastController {
     private val reconnectStep: Runnable = object : Runnable {
         override fun run() {
             if (!reconnecting || mode != "video") return
-            val online = current?.online == true
             val oldBase = currentBase()
-            val candidates = if (online) emptyList() else listOfNotNull(latestPhoneBase(), oldBase).distinct()
+            val candidates = listOfNotNull(latestPhoneBase(), oldBase).distinct()
             io.execute {
-                val good = if (online) "online" else candidates.firstOrNull { httpOk("$it/alive") }
+                val good = candidates.firstOrNull { httpOk("$it/alive") }
                 runOnUiThread {
                     if (!reconnecting || isFinishing) return@runOnUiThread
-                    val p = player ?: return@runOnUiThread
                     if (good != null) {
-                        val idx = p.currentMediaItemIndex
-                        if (!online && oldBase != null && good != oldBase) {
+                        if (++reconnectAttempts > 4) {
+                            // The phone answers but this file keeps failing: it's the file, not the network.
+                            reconnecting = false
+                            errorText = "cannot play"
+                            showCaption("This video keeps failing to play.\nPress ☰ → Play in VLC / MX Player, or pick another video.", 30_000)
+                            return@runOnUiThread
+                        }
+                        if (oldBase != null && good != oldBase) {
                             // Phone got a new IP address: switch every link in the list, keep the position.
                             queue = queue.map { v ->
                                 v.copy(url = v.url.replace(oldBase, good), sub = v.sub?.replace(oldBase, good))
                             }.toMutableList()
-                            p.setMediaItems(queue.map { buildItem(it) }, idx, resumeAt)
-                            syncCurrent()
-                        } else {
-                            p.seekTo(idx, resumeAt)
                         }
-                        p.prepare()
-                        p.playWhenReady = true
+                        val at = resumeAt
+                        startItem(qIndex, at)
+                        resumeAt = at
                         showCaption("Reconnected", 2000)
-                        // reconnecting is cleared once the player is READY again
+                        // reconnecting is cleared once VLC reports Playing; if it doesn't, try again.
+                        handler.postDelayed(this, 15_000)
                     } else {
                         val waited = (System.currentTimeMillis() - reconnectStartedAt) / 1000
                         if (waited > RECONNECT_GIVE_UP_S) {
@@ -401,194 +630,89 @@ class PlayerActivity : AppCompatActivity(), CastController {
         }
     }
 
-    private fun createPlayer(): ExoPlayer {
-        val passthrough = audioPassthrough
-        val renderers = object : DefaultRenderersFactory(this) {
-            override fun buildAudioSink(context: android.content.Context, enableFloatOutput: Boolean, enableAudioTrackPlaybackParams: Boolean): AudioSink? {
-                if (passthrough) return super.buildAudioSink(context, enableFloatOutput, enableAudioTrackPlaybackParams)
-                // Decode Dolby/DTS on the TV instead of passing it through: passthrough audio can't change speed.
-                @Suppress("DEPRECATION")
-                return DefaultAudioSink.Builder(context)
-                    .setAudioCapabilities(AudioCapabilities.DEFAULT_AUDIO_CAPABILITIES)
-                    .setEnableFloatOutput(enableFloatOutput)
-                    .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-                    .build()
+    /**
+     * The phone stopped sending (usually: it was locked and Android paused TV Cast there, or its Wi-Fi dozed).
+     * After a while open a fresh connection at the same spot; if the phone doesn't answer, reconnect.
+     */
+    private fun checkStall() {
+        val p = mp
+        val c = current
+        val now = System.currentTimeMillis()
+        val t = p?.time ?: 0L
+        // "Wants to play" (not paused by the user) but the position isn't moving.
+        val wantsToPlay = p != null && (p.isPlaying || buffering)
+        val moving = t != stallTime
+        stallTime = t
+        val stalled = mode == "video" && wantsToPlay && !moving && c != null && !c.online && !c.radio &&
+            !reconnecting && !ended && errorText.isEmpty() && started && seekTarget < 0
+        if (!stalled) { stallSince = 0L; return }
+        if (stallSince == 0L) { stallSince = now; return }
+        val waited = now - stallSince
+        if (waited < STALL_MS || now - lastStallFix < STALL_MS) return
+        lastStallFix = now
+        stallSince = 0L
+        val b = currentBase() ?: return
+        val at = lastTime
+        showCaption(
+            "Waiting for the phone…\nIf it's locked, Android may have paused TV Cast there. Unlocking it continues the video;\n" +
+                "to stop this happening, allow TV Cast to run without battery restrictions on the phone.", 10_000
+        )
+        io.execute {
+            val alive = httpOk("$b/alive")
+            runOnUiThread {
+                if (isFinishing || mode != "video" || (mp?.time ?: 0L) != at && (mp?.time ?: 0L) > at + 2000) return@runOnUiThread // recovered meanwhile
+                if (alive) startItem(qIndex, at).also { resumeAt = at } // stuck connection: start a fresh one
+                else startReconnect()
             }
-        }.setEnableDecoderFallback(true)
-        // Ad/tracker requests are refused at the network layer; short Wi-Fi blips are retried silently.
-        val sources = androidx.media3.exoplayer.source.DefaultMediaSourceFactory(AdBlock.dataSourceFactory(this))
-            .setLoadErrorHandlingPolicy(androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy(10))
-        val p = ExoPlayer.Builder(this, renderers)
-            .setMediaSourceFactory(sources)
-            // Default buffering can take ~130 MB, too much for this 1 GB TV: cap it at 40 MB / 40 s.
-            .setLoadControl(
-                androidx.media3.exoplayer.DefaultLoadControl.Builder()
-                    .setBufferDurationsMs(15_000, 40_000, 2_500, 5_000)
-                    .setTargetBufferBytes(40 * 1024 * 1024)
-                    .setPrioritizeTimeOverSizeThresholds(false)
-                    .build()
-            )
-            .setAudioAttributes(AudioAttributes.DEFAULT, true)
-            .setSeekBackIncrementMs(10_000)
-            .setSeekForwardIncrementMs(10_000)
-            .build()
-        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
-            .setPreferredTextLanguage("en")
-            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, !subsOn)
-            .build()
-        p.addListener(object : Player.Listener {
-            override fun onPlayerError(error: PlaybackException) {
-                if (mode == "video" && current?.radio == true && queue.size > 1 && ++radioFails < queue.size) {
-                    // Dead station: move on to the next one after a moment.
-                    showCaption("${current?.title ?: "Station"} isn't on air right now, trying the next station…", 4000)
-                    handler.postDelayed({ if (player?.playerError != null && current?.radio == true) skip(1) }, 2500)
-                    return
-                }
-                if (mode == "images") {
-                    // Album video that can't be played: carry on with the slideshow.
-                    showCaption("Couldn't play this video, skipping", 3000)
-                    endSlideVideo(advance = true)
-                    return
-                }
-                val online = current?.online == true
-                // 2xxx = network/IO errors: the file is fine, the connection isn't. Reconnect automatically.
-                if (error.errorCode in 2000..2999 && mode == "video" && !online) {
-                    startReconnect()
-                } else if (online) {
-                    showCaption("Can't play this link (${error.errorCodeName}).\nIt may need a website login, or it isn't a direct video/stream link.", 15_000)
-                } else {
-                    showCaption("Cannot play: ${error.errorCodeName}\nPress ☰ (menu) to open in VLC / MX Player", 15_000)
-                }
-            }
-
-            override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
-                if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) return
-                // Played to the end and moved on by itself: remember the finished one as watched.
-                if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO && key.isNotEmpty() && lastDur > 0) {
-                    History.save(applicationContext, key, title, lastDur, lastDur)
-                }
-                handler.removeCallbacks(doSeek)
-                seekTarget = -1L
-                syncCurrent()
-                resetView()
-                val c = current ?: return
-                val p = player ?: return
-                if (c.radio) { showCaption("${c.title}  (${p.currentMediaItemIndex + 1} of ${queue.size})", 3000); return }
-                // Next video in the list: continue where it was left, if it was half watched.
-                val h = if (c.online) null else History.find(this@PlayerActivity, c.key)
-                val pos = h?.optLong("pos") ?: 0L
-                val dur = h?.optLong("dur") ?: 0L
-                val n = "(${p.currentMediaItemIndex + 1} of ${queue.size})"
-                if (pos > 10_000 && dur > 0 && pos < dur - 30_000) {
-                    p.seekTo(pos)
-                    showCaption("${c.title}\nResumed from ${fmt(pos)}  $n", 4000)
-                } else {
-                    showCaption("${c.title}  $n", 3000)
-                }
-            }
-
-            override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
-                if (!checkDecodedAudio || tracks.groups.isEmpty()) return
-                checkDecodedAudio = false
-                val hasAudio = tracks.groups.any { it.type == C.TRACK_TYPE_AUDIO }
-                if (hasAudio && !tracks.isTypeSelected(C.TRACK_TYPE_AUDIO)) {
-                    // The TV can't decode this audio itself, so it can only play it at normal speed.
-                    handler.post { rebuildPlayer(passthrough = true, speed = 1f) }
-                    showCaption("This audio (Dolby/DTS) can only play at 1x on this TV.\nPick another audio track in ☰, or ☰ → Play in VLC to change speed.", 8000)
-                }
-            }
-
-            override fun onAudioSessionIdChanged(audioSessionId: Int) {
-                Sound.attach(this@PlayerActivity, audioSessionId)
-            }
-
-            override fun onPlaybackStateChanged(state: Int) {
-                if (state == Player.STATE_READY) radioFails = 0
-                if (state == Player.STATE_READY && reconnecting) {
-                    reconnecting = false
-                    handler.removeCallbacks(reconnectStep)
-                }
-                if (state == Player.STATE_ENDED && mode == "images") {
-                    endSlideVideo(advance = true)
-                    return
-                }
-                if (state == Player.STATE_ENDED) {
-                    saveProgress()
-                    showCaption("Finished. Closing in 10 seconds…", 10_000)
-                    handler.postDelayed(closeIfEnded, 10_000)
-                }
-            }
-        })
-        playerView.player = p
-        playerView.resizeMode = ASPECTS[aspect].first
-        player = p
-        return p
+        }
     }
 
-    private fun releasePlayer() {
-        saveProgress()
-        Sound.release()
-        playerView.player = null
-        player?.release()
-        player = null
+    /** Best known position of the current item. */
+    private fun position(): Long {
+        if (seekTarget >= 0) return seekTarget
+        val t = mp?.time ?: 0L
+        return if (t > 0 && mode == "video") t else lastTime
     }
 
     private fun saveProgress() {
-        val p = player ?: return
-        if (mode != "video" || key.isEmpty()) return
-        // Ignore a player that's between items or not ready yet (would save a wrong length).
-        if (p.currentMediaItem?.mediaId != key) return
-        val dur = p.duration
+        if (mode != "video" || key.isEmpty() || mp == null) return
+        val dur = length
         if (dur <= 0) return
-        lastDur = dur
-        val pos = when {
-            p.playbackState == Player.STATE_ENDED -> dur
-            seekTarget >= 0 -> seekTarget
-            else -> p.currentPosition
-        }
+        val pos = if (ended) dur else position()
+        if (pos <= 0) return
         History.save(applicationContext, key, title, pos, dur)
     }
 
-    /**
-     * ⏩/⏪ and ◀/▶: presses add up (hold the button to go faster) and the player seeks once they stop,
-     * to the nearest key frame. Big MKV files would otherwise restart loading on every single press.
-     */
+    /** ⏩/⏪ and ◀/▶: presses add up (hold the button to go faster) and the player seeks once they stop. */
     private fun seekBy(deltaMs: Long) {
-        val p = player ?: return
+        val p = mp ?: return
         if (current?.radio == true) { skip(if (deltaMs > 0) 1 else -1); return }
-        val dur = p.duration
-        if (!p.isCurrentMediaItemSeekable) {
-            when {
-                p.isCurrentMediaItemLive -> showCaption("This is a live stream, it can't be skipped through", 3000)
-                p.playbackState != Player.STATE_READY && dur <= 0 -> showCaption("Still loading…", 1500)
-                else -> showCaption("This file has no seek index, so it can't be skipped through here.\n" +
-                    "Press ☰ → Play in VLC / MX Player to skip.", 5000)
-            }
+        if (!p.isSeekable || length <= 0) {
+            showCaption(if (length <= 0 && !buffering) "This is a live stream, it can't be skipped through" else "Still loading…", 2000)
             return
         }
-        val from = if (seekTarget >= 0) seekTarget else p.currentPosition
-        var target = (from + deltaMs).coerceAtLeast(0)
-        if (dur > 0) target = target.coerceAtMost(dur - 1000)
+        val from = position()
+        val target = (from + deltaMs).coerceIn(0, (length - 1000).coerceAtLeast(0))
         seekTarget = target
-        // Forward never lands before the target, backward never after it, so every press moves.
-        val slack = 8_000_000L
-        p.setSeekParameters(if (deltaMs > 0) SeekParameters(0, slack) else SeekParameters(slack, 0))
-        val diff = target - p.currentPosition
+        val now = if (p.time > 0) p.time else lastTime
+        val diff = target - now
         val sign = if (diff >= 0) "+" else "−"
-        showCaption("${fmt(target)} / ${fmt(dur.coerceAtLeast(0))}    ($sign${fmt(kotlin.math.abs(diff))})", 1800)
+        showCaption("${fmt(target)} / ${fmt(length)}    ($sign${fmt(kotlin.math.abs(diff))})", 1800)
+        if (controls.visibility == View.VISIBLE) updateControls()
         handler.removeCallbacks(doSeek)
         handler.postDelayed(doSeek, SEEK_DELAY_MS)
     }
 
     private val doSeek = Runnable {
         val t = seekTarget
+        val p = mp
         seekTarget = -1L
-        val p = player ?: return@Runnable
-        if (t >= 0) {
-            p.seekTo(t)
-            p.setSeekParameters(SeekParameters.DEFAULT) // resume / phone seeks stay exact
-            saveProgress()
+        if (t >= 0 && p != null) {
+            if (ended) startItem(qIndex, t)
+            else p.setTime(t, false) // exact: a key-frame seek can land before the target and lose the jump
+            lastTime = t
         }
+        saveProgress()
     }
 
     /** Seek step for a held-down button: 10 s, then 30 s, then 1 min, then 2 min. */
@@ -599,61 +723,29 @@ class PlayerActivity : AppCompatActivity(), CastController {
         else -> 120_000L
     }
 
-    /** Selected audio is Dolby/DTS going straight to the TV/soundbar, where speed changes are ignored. */
-    private fun audioIsPassthrough(): Boolean {
-        if (!audioPassthrough) return false
-        val p = player ?: return false
-        val f = p.currentTracks.groups.firstOrNull { it.type == C.TRACK_TYPE_AUDIO && it.isSelected }
-            ?.let { g -> (0 until g.length).firstOrNull { g.isTrackSelected(it) }?.let { g.getTrackFormat(it) } }
-            ?: return false
-        val mime = f.sampleMimeType ?: return false
-        if (mime !in PASSTHROUGH_MIMES) return false
-        return runCatching { AudioCapabilities.getCapabilities(this).isPassthroughPlaybackSupported(f) }.getOrDefault(true)
-    }
-
-    /** Recreates the player at the same spot, with Dolby/DTS audio passed through or decoded on the TV. */
-    private fun rebuildPlayer(passthrough: Boolean, speed: Float) {
-        val old = player ?: return
-        val idx = old.currentMediaItemIndex
-        val pos = if (seekTarget >= 0) seekTarget else old.currentPosition
-        val playing = old.playWhenReady
-        val lang = old.currentTracks.groups.firstOrNull { it.type == C.TRACK_TYPE_AUDIO && it.isSelected }
-            ?.let { g -> (0 until g.length).firstOrNull { g.isTrackSelected(it) }?.let { g.getTrackFormat(it).language } }
-        handler.removeCallbacks(doSeek)
-        seekTarget = -1L
-        releasePlayer()
-        audioPassthrough = passthrough
-        val p = createPlayer()
-        if (lang != null) p.trackSelectionParameters = p.trackSelectionParameters.buildUpon().setPreferredAudioLanguage(lang).build()
-        p.setMediaItems(queue.map { buildItem(it) }, idx, pos)
-        p.setPlaybackSpeed(speed)
-        p.prepare()
-        p.playWhenReady = playing
-        applyLook()
-    }
-
     private fun togglePlay() {
-        val p = player ?: return
-        if (p.playerError != null) {
+        val p = mp ?: return
+        if (reconnecting) return
+        if (ended) { startItem(qIndex, 0); return }
+        if (errorText.isNotEmpty()) {
             // After an error, Play means "try again" from where it stopped.
-            reconnecting = false
-            startReconnect()
+            if (current?.online == true) startItem(qIndex, lastTime)
+            else { reconnectAttempts = 0; startReconnect() }
             return
         }
-        if (p.playWhenReady && p.playbackState != Player.STATE_ENDED) {
-            p.pause()
-        } else {
-            if (p.playbackState == Player.STATE_ENDED) p.seekTo(0)
-            p.play()
-        }
+        if (p.isPlaying) p.pause() else p.play()
+        handler.postDelayed({ updateControls() }, 150)
     }
 
     private fun cycleAspect() = setAspect((aspect + 1) % ASPECTS.size)
 
     private fun setAspect(i: Int) {
         aspect = i.coerceIn(0, ASPECTS.size - 1)
-        playerView.resizeMode = ASPECTS[aspect].first
+        prefs.edit().putInt("aspect", aspect).apply()
+        mp?.videoScale = ASPECTS[aspect].first
+        handler.postDelayed({ applyTransform() }, 200)
         showCaption("Screen size: ${ASPECTS[aspect].second}", 1500)
+        updateControls()
     }
 
     private fun setVolume(level: Int) {
@@ -672,74 +764,87 @@ class PlayerActivity : AppCompatActivity(), CastController {
         audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_SAME, AudioManager.FLAG_SHOW_UI)
     }
 
-    private fun setSpeed(speed: Float) {
-        val p = player ?: return
+    private fun setSpeed(s: Float) {
         if (mode != "video") return
         if (current?.radio == true) { showCaption("Live radio always plays at normal speed", 2000); return }
-        when {
-            speed != 1f && audioIsPassthrough() -> {
-                // Passthrough audio ignores speed changes: decode it on the TV while playing faster/slower.
-                checkDecodedAudio = true
-                rebuildPlayer(passthrough = false, speed = speed)
-            }
-            // Back to normal: send surround sound to the TV/soundbar untouched again.
-            speed == 1f && !audioPassthrough -> rebuildPlayer(passthrough = true, speed = 1f)
-            else -> p.setPlaybackSpeed(speed)
-        }
-        showCaption("Speed ${speed}x", 1500)
+        speed = s.coerceIn(0.25f, 4f)
+        mp?.rate = speed
+        showCaption("Speed ${speedLabel(speed)}", 1500)
+        updateControls()
+    }
+
+    private fun speedLabel(s: Float) = (if (s % 1f == 0f) "${s.toInt()}" else "$s") + "x"
+
+    private fun setAudioDelay(ms: Long) {
+        prefs.edit().putLong("audioDelay", ms).apply()
+        mp?.setAudioDelay(ms * 1000)
+        showCaption("Audio sync: ${delayLabel(ms)}", 2500)
+    }
+
+    private fun setSubDelay(ms: Long) {
+        prefs.edit().putLong("subDelay", ms).apply()
+        mp?.setSpuDelay(ms * 1000)
+        showCaption("Subtitle sync: ${delayLabel(ms)}", 2500)
+    }
+
+    private fun delayLabel(ms: Long) = when {
+        ms == 0L -> "0 (normal)"
+        ms > 0 -> "+$ms ms (later)"
+        else -> "$ms ms (earlier)"
+    }
+
+    private fun setPassthrough(on: Boolean) {
+        prefs.edit().putBoolean("passthrough", on).apply()
+        val p = mp ?: return
+        p.setAudioDigitalOutputEnabled(on)
+        // Takes effect when the audio restarts: continue from the same spot.
+        if (mode == "video" && current?.radio != true) startItem(qIndex, position())
+        showCaption(if (on) "Dolby/DTS sent to the TV/soundbar as-is (only if it supports them)" else "Dolby/DTS decoded on the TV (works everywhere)", 4000)
     }
 
     private fun toggleSubs() {
-        val p = player ?: return
-        subsOn = !subsOn
-        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
-            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, !subsOn).build()
+        val p = mp ?: return
+        if (subsOn) {
+            subsOn = false
+            p.setSpuTrack(-1)
+        } else {
+            subsOn = true
+            val first = p.spuTracks?.firstOrNull { it.id != -1 }
+            if (first != null) p.setSpuTrack(first.id)
+            else subUrl?.let { p.addSlave(IMedia.Slave.Type.Subtitle, Uri.parse(it), true) }
+        }
         showCaption(if (subsOn) "Subtitles on" else "Subtitles off", 1500)
+        updateControls()
     }
 
-    /** id is "group:track" from [tracksJson], or "off" to disable subtitles. */
+    /** id is a track id from [tracksJson], or "off" to disable subtitles. */
     private fun selectTrack(type: Int, id: String?) {
-        val p = player ?: return
-        val b = p.trackSelectionParameters.buildUpon()
+        val p = mp ?: return
         if (id == null || id == "off") {
-            if (type != C.TRACK_TYPE_TEXT) return
+            if (type != TRACK_TEXT) return
             subsOn = false
-            b.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+            p.setSpuTrack(-1)
             showCaption("Subtitles off", 1500)
         } else {
-            val (g, t) = id.split(':').map { it.toInt() }
-            val group = p.currentTracks.groups.getOrNull(g) ?: return
-            b.setTrackTypeDisabled(type, false)
-                .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, t))
-            if (type == C.TRACK_TYPE_TEXT) subsOn = true
-            showCaption(trackLabel(group.getTrackFormat(t), t + 1), 2000)
+            val n = id.toIntOrNull() ?: return
+            if (type == TRACK_TEXT) { subsOn = true; p.setSpuTrack(n) } else p.setAudioTrack(n)
+            val name = (if (type == TRACK_TEXT) p.spuTracks else p.audioTracks)?.firstOrNull { it.id == n }?.name
+            showCaption(name ?: "Track changed", 2000)
         }
-        p.trackSelectionParameters = b.build()
+        updateControls()
     }
 
     private fun tracksJson(type: Int): JSONArray {
         val arr = JSONArray()
-        val p = player ?: return arr
-        p.currentTracks.groups.forEachIndexed { g, group ->
-            if (group.type != type) return@forEachIndexed
-            for (t in 0 until group.length) {
-                var label = trackLabel(group.getTrackFormat(t), arr.length() + 1)
-                if (!group.isTrackSupported(t)) label += " (not supported)"
-                arr.put(JSONObject().put("id", "$g:$t").put("label", label).put("selected", group.isTrackSelected(t)))
-            }
+        val p = mp ?: return arr
+        if (mode != "video") return arr
+        val list = (if (type == TRACK_TEXT) p.spuTracks else p.audioTracks) ?: return arr
+        val sel = if (type == TRACK_TEXT) p.spuTrack else p.audioTrack
+        list.filter { it.id != -1 }.forEachIndexed { i, t ->
+            val label = t.name?.takeIf { it.isNotBlank() } ?: "Track ${i + 1}"
+            arr.put(JSONObject().put("id", t.id.toString()).put("label", label).put("selected", t.id == sel))
         }
         return arr
-    }
-
-    private fun trackLabel(f: Format, n: Int): String {
-        val parts = mutableListOf<String>()
-        f.label?.let { parts += it }
-        f.language?.takeIf { it != "und" }?.let { parts += Locale(it).displayLanguage }
-        if (f.channelCount > 0) parts += when (f.channelCount) {
-            1 -> "Mono"; 2 -> "Stereo"; 6 -> "5.1"; 8 -> "7.1"; else -> "${f.channelCount}ch"
-        }
-        f.sampleMimeType?.substringAfter('/')?.uppercase()?.let { parts += it }
-        return "Track $n" + if (parts.isEmpty()) "" else ": " + parts.distinct().joinToString(" · ")
     }
 
     private fun volume(direction: Int) {
@@ -749,70 +854,99 @@ class PlayerActivity : AppCompatActivity(), CastController {
     /** Hands the current video to another player app on the TV (VLC, MX Player…) at the same position. */
     private fun openExternal(pkg: String?) {
         if (mode != "video" || videoUrl.isEmpty()) return
-        val pos = player?.currentPosition ?: 0L
+        val pos = position()
         saveProgress()
-        val i = Intent(Intent.ACTION_VIEW)
-            .setDataAndType(Uri.parse(videoUrl), "video/*")
-            .putExtra("title", title)
-            .putExtra("position", pos.toInt())  // MX Player
-            .putExtra("extra_position", pos)    // VLC
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        subUrl?.let { s ->
-            i.putExtra("subs", arrayOf<android.os.Parcelable>(Uri.parse(s)))
-            i.putExtra("subtitles_location", s)
-        }
-        if (pkg != null) i.setPackage(pkg)
+        handedOff = true // the phone keeps sharing; the other app is still using it
         try {
-            startActivity(if (pkg == null) Intent.createChooser(i, "Open with").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) else i)
+            startActivity(ExternalActivity.intent(this, videoUrl, currentBase(), key, title, pos, pkg, subUrl))
             finish()
         } catch (e: Exception) {
+            handedOff = false
             showCaption("That player is not installed", 3000)
         }
     }
 
+    /** Other player apps, VLC first; MX Player can't play Dolby/DTS sound by itself. */
+    private fun externalEntries(): List<Pair<String, () -> Unit>> = cachedPlayers
+        .sortedBy { (pkg, _) -> if (pkg.startsWith("org.videolan")) 0 else 1 }
+        .map { (pkg, name) ->
+            val note = if (pkg.startsWith("com.mxtech")) "  (may have no AC3/DTS sound)" else ""
+            "Play in $name$note" to { openExternal(pkg) }
+        }
+
+    private fun pickAudio() = pickTrack("Audio track", tracksJson(TRACK_AUDIO), TRACK_AUDIO, false)
+    private fun pickSubs() = pickTrack("Subtitles", tracksJson(TRACK_TEXT), TRACK_TEXT, true)
+
+    private fun pickSpeed() {
+        choose("Speed", SPEEDS.map { speedLabel(it) }, SPEEDS.indexOf(speed)) { setSpeed(SPEEDS[it]) }
+    }
+
+    private fun pickDelay(title: String, current: Long, onPick: (Long) -> Unit) {
+        val labels = DELAYS.map { delayLabel(it) }
+        choose(title, labels, DELAYS.indexOf(current).takeIf { it >= 0 } ?: DELAYS.indexOf(0L)) { onPick(DELAYS[it]) }
+    }
+
     private fun showMenu() {
-        val p = player ?: return
-        val audioTracks = tracksJson(C.TRACK_TYPE_AUDIO)
-        val subTracks = tracksJson(C.TRACK_TYPE_TEXT)
+        val p = mp ?: return
+        val audioTracks = tracksJson(TRACK_AUDIO)
+        val subTracks = tracksJson(TRACK_TEXT)
         fun selectedLabel(a: JSONArray): String? =
             (0 until a.length()).map { a.getJSONObject(it) }.firstOrNull { it.optBoolean("selected") }?.optString("label")
         val vol = audio.getStreamVolume(AudioManager.STREAM_MUSIC)
         val volMax = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-        val players = externalPlayers(this)
+        val radio = current?.radio == true
+        val passthrough = prefs.getBoolean("passthrough", false)
 
         val entries = mutableListOf<Pair<String, () -> Unit>>()
-        entries += "Audio track:  ${selectedLabel(audioTracks) ?: "—"}" to { pickTrack("Audio track", audioTracks, C.TRACK_TYPE_AUDIO, false) }
-        entries += "Subtitles:  ${if (subsOn) selectedLabel(subTracks) ?: "On" else "Off"}" to { pickTrack("Subtitles", subTracks, C.TRACK_TYPE_TEXT, true) }
-        entries += "Screen size:  ${ASPECTS[aspect].second}" to {
-            choose("Screen size", ASPECTS.map { it.second }, aspect) { setAspect(it) }
+        if (!radio) {
+            entries += "Audio track:  ${selectedLabel(audioTracks) ?: "—"}" to { pickAudio() }
+            entries += "Subtitles:  ${if (subsOn) selectedLabel(subTracks) ?: "On" else "Off"}" to { pickSubs() }
+            entries += "Audio sync (lip sync):  ${delayLabel(prefs.getLong("audioDelay", 0))}" to {
+                pickDelay("Audio sync — later if sound comes before the lips", prefs.getLong("audioDelay", 0)) { setAudioDelay(it) }
+            }
+            entries += "Subtitle sync:  ${delayLabel(prefs.getLong("subDelay", 0))}" to {
+                pickDelay("Subtitle sync — later if subtitles come too early", prefs.getLong("subDelay", 0)) { setSubDelay(it) }
+            }
+            entries += "Screen size:  ${ASPECTS[aspect].second}" to {
+                choose("Screen size", ASPECTS.map { it.second }, aspect) { setAspect(it) }
+            }
         }
         entries += "Volume:  $vol / $volMax" to {
             val step = if (volMax > 30) 5 else 1
             val levels = (0..volMax step step).toList()
             choose("Volume", levels.map { if (it == 0) "Mute" else "$it" }, levels.indexOfFirst { it >= vol }) { setVolume(levels[it]) }
         }
-        entries += "Speed:  ${p.playbackParameters.speed}x" to {
-            choose("Speed", SPEEDS.map { "${it}x" }, SPEEDS.indexOf(p.playbackParameters.speed)) { setSpeed(SPEEDS[it]) }
-        }
-        entries += "Rotate:  $rotation°" to {
-            choose("Rotate video", listOf("0° (normal)", "90° right", "180° (upside down)", "270° (90° left)"), rotation / 90) {
-                rotation = it * 90; applyTransform(); showCaption("Rotation: $rotation°", 1500)
+        if (!radio) {
+            entries += "Speed:  ${speedLabel(speed)}" to { pickSpeed() }
+            entries += "Rotate:  $rotation°" to {
+                choose("Rotate video", listOf("0° (normal)", "90° right", "180° (upside down)", "270° (90° left)"), rotation / 90) {
+                    rotation = it * 90; ensureSurface(); applyTransform(); showCaption("Rotation: $rotation°", 1500)
+                }
             }
-        }
-        entries += "Zoom:  ${if (zoom == 1f) "off" else zoomLabel(zoom)}" to {
-            choose("Zoom", ZOOMS.map { if (it == 1f) "Off (1×)" else zoomLabel(it) }, ZOOMS.indexOfFirst { it >= zoom - 0.01f }) {
-                setZoom(ZOOMS[it])
+            entries += "Zoom:  ${if (zoom == 1f) "off" else zoomLabel(zoom)}" to {
+                choose("Zoom", ZOOMS.map { if (it == 1f) "Off (1×)" else zoomLabel(it) }, ZOOMS.indexOfFirst { it >= zoom - 0.01f }) {
+                    setZoom(ZOOMS[it])
+                }
             }
+            entries += "Restart from beginning" to { if (ended) startItem(qIndex, 0) else { p.setTime(0); p.play() } }
+            if (queue.size > 1) {
+                entries += "Next video  (${qIndex + 1} of ${queue.size})" to { skip(1) }
+                entries += "Previous video" to { skip(-1) }
+            }
+            entries += "Picture mode:  ${Look.mode(this)}" to { pickPictureMode() }
+        } else if (queue.size > 1) {
+            entries += "Next station  (${qIndex + 1} of ${queue.size})" to { skip(1) }
+            entries += "Previous station" to { skip(-1) }
         }
-        entries += "Restart from beginning" to { p.seekTo(0); p.play() }
-        if (queue.size > 1) {
-            entries += "Next video  (${p.currentMediaItemIndex + 1} of ${queue.size})" to { skip(1) }
-            entries += "Previous video" to { skip(-1) }
-        }
-        entries += "Picture mode:  ${Look.mode(this)}" to { pickPictureMode() }
         entries += "Sound mode:  ${Sound.mode(this)}" to { pickSoundMode() }
+        entries += "Surround sound:  ${if (passthrough) "pass Dolby/DTS to soundbar" else "decode on TV"}" to {
+            choose("Surround sound (Dolby / DTS)", listOf(
+                "Decode on the TV — always has sound (recommended)",
+                "Pass through to TV/soundbar — only if it supports Dolby/DTS",
+            ), if (passthrough) 1 else 0) { setPassthrough(it == 1) }
+        }
         if (current?.online != true) {
-            players.forEach { (pkg, name) -> entries += "Play in $name" to { openExternal(pkg) } }
+            entries += externalEntries()
             entries += "Open with other app…" to { openExternal(null) }
         }
         entries += "Disconnect phone & close" to { disconnect() }
@@ -823,21 +957,97 @@ class PlayerActivity : AppCompatActivity(), CastController {
             .show()
     }
 
+    // ------------------------------------------------------------ on-screen controls
+
+    private fun setupControls() {
+        btnPlay.setOnClickListener { togglePlay() }
+        btnRew.setOnClickListener { seekBy(-10_000) }
+        btnFwd.setOnClickListener { seekBy(10_000) }
+        btnPrev.setOnClickListener { skip(-1) }
+        btnNext.setOnClickListener { skip(1) }
+        btnAudio.setOnClickListener { pickAudio() }
+        btnSubs.setOnClickListener { pickSubs() }
+        btnSpeed.setOnClickListener { pickSpeed() }
+        btnAspect.setOnClickListener { cycleAspect() }
+        findViewById<View>(R.id.btnMore).setOnClickListener { showMenu() }
+        ctlSeek.setOnClickListener { togglePlay() }
+    }
+
+    private fun showControls(focus: View? = null) {
+        if (mode != "video") return
+        val wasVisible = controls.visibility == View.VISIBLE
+        controls.visibility = View.VISIBLE
+        updateControls()
+        if (focus != null && focus.visibility == View.VISIBLE && focus.isShown) focus.requestFocus()
+        else if (!wasVisible || controls.findFocus() == null) btnPlay.requestFocus()
+        scheduleHide()
+    }
+
+    private fun scheduleHide() {
+        handler.removeCallbacks(hideControls)
+        handler.postDelayed(hideControls, CONTROLS_MS)
+    }
+
+    private fun updateControls() {
+        val p = mp ?: return
+        if (mode != "video") return
+        val radio = current?.radio == true
+        ctlTitle.text = title
+        ctlInfo.text = buildList {
+            if (radio) add("Live radio")
+            if (queue.size > 1) add("${qIndex + 1} of ${queue.size}")
+            p.currentVideoTrack?.let { v -> if (v.height > 0) add(qualityLabel(v.width, v.height)) }
+            if (speed != 1f && !radio) add("Speed ${speedLabel(speed)}")
+            if (reconnecting) add("Reconnecting…")
+        }.joinToString("  ·  ")
+        val pos = position()
+        val seekable = !radio && length > 0
+        ctlSeekRow.visibility = if (seekable) View.VISIBLE else View.GONE
+        if (seekable) {
+            ctlPos.text = fmt(pos)
+            ctlDur.text = fmt(length)
+            ctlSeek.progress = (pos * 1000 / length).toInt().coerceIn(0, 1000)
+        }
+        btnPlay.setImageResource(if (p.isPlaying && !ended) R.drawable.ic_ctl_pause else R.drawable.ic_ctl_play)
+        val many = queue.size > 1
+        btnPrev.visibility = if (many) View.VISIBLE else View.GONE
+        btnNext.visibility = if (many) View.VISIBLE else View.GONE
+        btnRew.visibility = if (seekable) View.VISIBLE else View.GONE
+        btnFwd.visibility = if (seekable) View.VISIBLE else View.GONE
+        val vis = if (radio) View.GONE else View.VISIBLE
+        btnAudio.visibility = vis
+        btnSubs.visibility = vis
+        btnSpeed.visibility = vis
+        btnAspect.visibility = vis
+        btnSubs.text = if (subsOn && p.spuTrack != -1) "Subtitles: on" else "Subtitles: off"
+        btnSpeed.text = speedLabel(speed)
+        btnAspect.text = ASPECTS[aspect].second.substringBefore(" (")
+    }
+
+    private fun qualityLabel(w: Int, h: Int): String = when {
+        h >= 2000 || w >= 3800 -> "4K"
+        h >= 1000 || w >= 1900 -> "Full HD 1080p"
+        h >= 700 || w >= 1260 -> "HD 720p"
+        else -> "${h}p"
+    } + "  ($w×$h)"
+
     // -------------------------------------------------- picture & sound modes
 
     private fun applyLook() {
         val f = Look.filter(this)
-        (playerView.videoSurfaceView as? android.view.TextureView)?.let { tv ->
-            tv.setLayerPaint(f?.let { android.graphics.Paint().apply { colorFilter = it } })
-        }
+        textureView()?.setLayerPaint(f?.let { android.graphics.Paint().apply { colorFilter = it } })
         image.colorFilter = f
+    }
+
+    private fun applySound() {
+        mp?.setEqualizer(Sound.vlcEqualizer(this))
     }
 
     private fun pickPictureMode() {
         val modes = Look.PRESETS.keys.toList()
         choose("Picture mode", modes, modes.indexOf(Look.mode(this))) {
             if (modes[it] == "Custom") customPicture()
-            else { Look.setMode(this, modes[it]); applyLook(); showCaption("Picture: ${modes[it]}", 1500) }
+            else { Look.setMode(this, modes[it]); ensureSurface(); applyLook(); showCaption("Picture: ${modes[it]}", 1500) }
         }
     }
 
@@ -852,6 +1062,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
         )
         sliders("Custom picture", rows) { v ->
             Look.setCustom(this, Look.Params(v[0] - 50, v[1] + 50, v[2], v[3] - 50))
+            ensureSurface()
             applyLook()
         }
     }
@@ -862,8 +1073,8 @@ class PlayerActivity : AppCompatActivity(), CastController {
             if (modes[it] == "Custom") customSound()
             else {
                 Sound.setMode(this, modes[it])
-                showCaption(if (Sound.supported) "Sound: ${modes[it]}" else
-                    "Sound: ${modes[it]} (not available for this audio track — try the AAC/stereo track)", 3000)
+                applySound()
+                showCaption("Sound: ${modes[it]}", 2000)
             }
         }
     }
@@ -874,6 +1085,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
         val rows = names.mapIndexed { i, n -> Triple(n, c.gains[i] + 12, 24) } + Triple("Loudness boost", c.boost, 12)
         sliders("Custom sound (dB)", rows) { v ->
             Sound.setCustom(this, Sound.Preset(v.take(5).map { it - 12 }, v[5]))
+            applySound()
         }
     }
 
@@ -885,7 +1097,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
         }
         val bars = rows.map { (label, value, max) ->
             val text = TextView(this).apply { setTextColor(0xFFE8EAED.toInt()); textSize = 15f }
-            val bar = android.widget.SeekBar(this).apply {
+            val bar = SeekBar(this).apply {
                 this.max = max
                 progress = value
                 keyProgressIncrement = 1
@@ -909,13 +1121,13 @@ class PlayerActivity : AppCompatActivity(), CastController {
         }
         refresh()
         bars.forEach { (_, _, bar) ->
-            bar.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(s: android.widget.SeekBar, p: Int, fromUser: Boolean) {
+            bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
                     refresh()
                     onChange(bars.map { it.third.progress })
                 }
-                override fun onStartTrackingTouch(s: android.widget.SeekBar) {}
-                override fun onStopTrackingTouch(s: android.widget.SeekBar) {}
+                override fun onStartTrackingTouch(s: SeekBar) {}
+                override fun onStopTrackingTouch(s: SeekBar) {}
             })
         }
         AlertDialog.Builder(this).setTitle(title).setView(box).setPositiveButton("Done", null).show()
@@ -953,38 +1165,20 @@ class PlayerActivity : AppCompatActivity(), CastController {
         choose(title, labels, checked) { selectTrack(type, ids[it]) }
     }
 
-    /** Adds Screen-size and Options buttons to the player's bottom bar so they're reachable with the remote. */
-    private fun addControllerButtons() {
-        val bar = playerView.findViewById<ViewGroup>(androidx.media3.ui.R.id.exo_basic_controls) ?: return
-        fun button(icon: Int, desc: String, onClick: () -> Unit) = ImageButton(
-            this, null, 0, androidx.media3.ui.R.style.ExoStyledControls_Button_Bottom
-        ).apply {
-            setImageResource(icon)
-            contentDescription = desc
-            setOnClickListener { onClick() }
-        }
-        bar.addView(button(R.drawable.ic_aspect, "Screen size") { cycleAspect() }, 0)
-        bar.addView(button(R.drawable.ic_zoom, "Zoom") { cycleZoom() }, 0)
-        bar.addView(button(R.drawable.ic_rotate, "Rotate") { rotate(90) }, 0)
-        bar.addView(button(R.drawable.ic_tune, "Options") { showMenu() }, 0)
-    }
-
-    private fun cycleZoom() {
-        val i = ZOOMS.indexOfFirst { it >= zoom - 0.01f }.coerceAtLeast(0)
-        setZoom(ZOOMS[(i + 1) % ZOOMS.size])
-    }
-
     // --------------------------------------------------------------- images
 
     private fun showImages(r: CastRequest.Images) {
-        releasePlayer()
+        saveProgress()
+        mp?.stop()
         slideVideo = false
         mode = "images"
         queue = mutableListOf()
+        controls.visibility = View.GONE
+        spinner.visibility = View.GONE
         urls = r.urls
         names = r.names
         albumVideos = r.albumVideos
-        playerView.visibility = View.GONE
+        videoLayout.visibility = View.GONE
         image.visibility = View.VISIBLE
         image.scaleType = ImageView.ScaleType.FIT_CENTER
         stopSlideshow()
@@ -1021,12 +1215,16 @@ class PlayerActivity : AppCompatActivity(), CastController {
     private fun playSlideVideo(url: String) {
         slideVideo = true
         handler.removeCallbacks(slideStep)
-        val p = player ?: createPlayer()
         image.visibility = View.GONE
-        playerView.visibility = View.VISIBLE
-        p.setMediaItem(MediaItem.fromUri(url))
-        p.prepare()
-        p.playWhenReady = true
+        videoLayout.visibility = View.VISIBLE
+        val p = vlc()
+        ensureSurface()
+        val m = Media(libVlc, Uri.parse(url))
+        m.setHWDecoderEnabled(true, false)
+        m.addOption(":network-caching=3000")
+        p.media = m
+        m.release()
+        p.play()
         showCaption("Video   (${index + 1}/${urls.size})   ·   OK to pause · ⏭ to skip", 4000)
     }
 
@@ -1034,8 +1232,8 @@ class PlayerActivity : AppCompatActivity(), CastController {
     private fun endSlideVideo(advance: Boolean) {
         if (!slideVideo) return
         slideVideo = false
-        releasePlayer()
-        playerView.visibility = View.GONE
+        mp?.stop()
+        videoLayout.visibility = View.GONE
         image.visibility = View.VISIBLE
         if (advance) {
             showImage(index + 1)
@@ -1053,12 +1251,13 @@ class PlayerActivity : AppCompatActivity(), CastController {
         zoom = 1f
         panX = 0f
         panY = 0f
-        if (apply) applyTransform()
+        if (apply) { ensureSurface(); applyTransform() }
     }
 
     private fun rotate(deg: Int) {
         rotation = ((rotation + deg) % 360 + 360) % 360
         panX = 0f; panY = 0f
+        ensureSurface()
         applyTransform()
         showCaption("Rotation: $rotation°", 1500)
     }
@@ -1066,6 +1265,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
     private fun setZoom(z: Float) {
         zoom = z.coerceIn(1f, ZOOMS.last())
         if (zoom == 1f) { panX = 0f; panY = 0f }
+        ensureSurface()
         applyTransform()
         showCaption(if (zoom == 1f) "Zoom: off" else "Zoom: ${zoomLabel(zoom)}" +
             if (mode == "images" && zoom > 1f) "  ·  arrows to move, Back to reset" else "", 2500)
@@ -1086,17 +1286,28 @@ class PlayerActivity : AppCompatActivity(), CastController {
     private fun zoomLabel(z: Float) = if (z % 1f == 0f) "${z.toInt()}×" else "${z}×"
 
     /**
-     * Applies rotation + zoom (+ pan for pictures) to the video surface or the picture.
+     * Applies rotation + zoom (+ pan for pictures) to the video or the picture.
      * For 90°/270° the content is shrunk so the rotated frame still fits the screen.
      */
     private fun applyTransform() {
-        val target: View = (if (mode == "video") playerView.videoSurfaceView as? View else image) ?: return
-        val cw = (if (mode == "video") playerView.width else image.width).toFloat()
-        val ch = (if (mode == "video") playerView.height else image.height).toFloat()
-        // Size of what is actually visible: the video surface, or the picture as fitted inside the screen.
+        val video = mode == "video" || slideVideo
+        val target: View = (if (video) textureView() else image) ?: return
+        val cw = (if (video) videoLayout.width else image.width).toFloat()
+        val ch = (if (video) videoLayout.height else image.height).toFloat()
+        // Size of what is actually visible: the video as fitted inside its view, or the fitted picture.
         var w = target.width.toFloat()
         var h = target.height.toFloat()
-        if (mode == "images") {
+        if (video) {
+            val vt = mp?.currentVideoTrack
+            if (vt != null && vt.width > 0 && vt.height > 0 && w > 0 && h > 0) {
+                val sar = if (vt.sarNum > 0 && vt.sarDen > 0) vt.sarNum.toFloat() / vt.sarDen else 1f
+                val vw = vt.width * sar
+                val vh = vt.height.toFloat()
+                val sc = minOf(w / vw, h / vh)
+                w = vw * sc
+                h = vh * sc
+            }
+        } else {
             val d = image.drawable
             if (d != null && d.intrinsicWidth > 0 && d.intrinsicHeight > 0 && cw > 0 && ch > 0) {
                 val sc = minOf(cw / d.intrinsicWidth, ch / d.intrinsicHeight)
@@ -1107,7 +1318,6 @@ class PlayerActivity : AppCompatActivity(), CastController {
         val turned = rotation % 180 != 0
         val rw = if (turned) h else w
         val rh = if (turned) w else h
-        // Turned 90°/270°: scale so the rotated frame fills the screen as much as possible.
         val fit = if (turned && rw > 0 && rh > 0) minOf(cw / rw, ch / rh) else 1f
         val s = fit * zoom
         val maxX = maxOf(0f, (rw * s - cw) / 2f)
@@ -1117,8 +1327,8 @@ class PlayerActivity : AppCompatActivity(), CastController {
         target.rotation = rotation.toFloat()
         target.scaleX = s
         target.scaleY = s
-        target.translationX = if (mode == "images") panX else 0f
-        target.translationY = if (mode == "images") panY else 0f
+        target.translationX = if (!video) panX else 0f
+        target.translationY = if (!video) panY else 0f
     }
 
     private fun showImageMenu() {
@@ -1154,22 +1364,23 @@ class PlayerActivity : AppCompatActivity(), CastController {
         val ms = v?.toLongOrNull()
         when (cmd) {
             "toggle" -> if (mode == "images") toggleSlideshow() else togglePlay()
-            "play" -> if (player?.playerError != null) togglePlay() else player?.play()
-            "pause" -> player?.pause()
-            "seek" -> if (ms != null) {
+            "play" -> if (errorText.isNotEmpty() || ended) togglePlay() else mp?.play()
+            "pause" -> mp?.pause()
+            "seek" -> if (ms != null && mode == "video") {
                 handler.removeCallbacks(doSeek)
                 seekTarget = -1L
-                player?.setSeekParameters(SeekParameters.CLOSEST_SYNC)
-                player?.seekTo(ms)
-                player?.setSeekParameters(SeekParameters.DEFAULT)
+                if (ended) startItem(qIndex, ms) else mp?.setTime(ms, false)
+                lastTime = ms
                 showCaption(fmt(ms), 1500)
             }
             "fwd" -> seekBy(ms ?: 10_000)
             "rew" -> seekBy(-(ms ?: 10_000))
             "subs" -> toggleSubs()
-            "subtrack" -> selectTrack(C.TRACK_TYPE_TEXT, v)
-            "audiotrack" -> selectTrack(C.TRACK_TYPE_AUDIO, v)
+            "subtrack" -> selectTrack(TRACK_TEXT, v)
+            "audiotrack" -> selectTrack(TRACK_AUDIO, v)
             "speed" -> v?.toFloatOrNull()?.let { setSpeed(it) }
+            "audiodelay" -> ms?.let { setAudioDelay(it) }
+            "subdelay" -> ms?.let { setSubDelay(it) }
             "aspect" -> if (v != null) setAspect(v.toIntOrNull() ?: 0) else cycleAspect()
             "setvol" -> v?.toIntOrNull()?.let { setVolume(it) }
             "volup" -> volume(AudioManager.ADJUST_RAISE)
@@ -1179,14 +1390,14 @@ class PlayerActivity : AppCompatActivity(), CastController {
             "next" -> if (mode == "video") skip(1) else showImage(index + 1)
             "prev" -> if (mode == "video") skip(-1) else showImage(index - 1)
             "picmode" -> v?.let { m ->
-                Look.setMode(this, m); applyLook(); showCaption("Picture: ${Look.mode(this)}", 1500)
+                Look.setMode(this, m); ensureSurface(); applyLook(); showCaption("Picture: ${Look.mode(this)}", 1500)
             }
             "piccustom" -> v?.split(',')?.mapNotNull { it.trim().toIntOrNull() }?.takeIf { it.size == 4 }?.let {
-                Look.setCustom(this, Look.Params(it[0], it[1], it[2], it[3])); applyLook()
+                Look.setCustom(this, Look.Params(it[0], it[1], it[2], it[3])); ensureSurface(); applyLook()
             }
-            "soundmode" -> v?.let { m -> Sound.setMode(this, m); showCaption("Sound: ${Sound.mode(this)}", 1500) }
+            "soundmode" -> v?.let { m -> Sound.setMode(this, m); applySound(); showCaption("Sound: ${Sound.mode(this)}", 1500) }
             "soundcustom" -> v?.split(',')?.mapNotNull { it.trim().toIntOrNull() }?.takeIf { it.size == 6 }?.let {
-                Sound.setCustom(this, Sound.Preset(it.take(5), it[5]))
+                Sound.setCustom(this, Sound.Preset(it.take(5), it[5])); applySound()
             }
             "showpin" -> PairDialog.showIfPending(this)
             "disconnect" -> disconnect()
@@ -1213,35 +1424,37 @@ class PlayerActivity : AppCompatActivity(), CastController {
             .put("picCustom", Look.custom(this).let { JSONArray(listOf(it.brightness, it.contrast, it.saturation, it.warmth)) })
             .put("soundMode", Sound.mode(this)).put("soundModes", JSONArray(Sound.PRESETS.keys.toList()))
             .put("soundCustom", Sound.custom(this).let { JSONArray(it.gains + it.boost) })
-            .put("soundOk", Sound.supported)
+            .put("soundOk", true)
         when (mode) {
             "video" -> {
-                val p = player
-                val err = p?.playerError?.errorCodeName
+                val p = mp
                 val c = current
                 j.put("title", title)
                     .put("key", key)
+                    .put("engine", "vlc")
                     .put("online", c?.online == true)
                     .put("radio", c?.radio == true)
                     .put("vpn", c?.online == true && (Vpn.up || AdBlock.vpnActive(this)))
                     .put("vpnName", if (Vpn.up) Vpn.provider(this) else "")
-                    .put("qIndex", p?.currentMediaItemIndex ?: 0)
+                    .put("qIndex", qIndex)
                     .put("qCount", queue.size)
-                    .put("error", if (reconnecting) "" else err ?: "")
+                    .put("error", if (reconnecting) "" else errorText)
                     .put("reconnecting", reconnecting)
-                    .put("playing", p != null && err == null && p.playWhenReady && p.playbackState != Player.STATE_ENDED)
-                    .put("buffering", p != null && p.playbackState == Player.STATE_BUFFERING)
-                    .put("ended", p != null && p.playbackState == Player.STATE_ENDED)
-                    .put("pos", p?.currentPosition ?: 0L)
-                    .put("dur", p?.duration?.takeIf { it > 0 } ?: 0L)
-                    .put("speed", p?.playbackParameters?.speed?.toDouble() ?: 1.0)
+                    .put("playing", p != null && p.isPlaying && !ended)
+                    .put("buffering", buffering)
+                    .put("ended", ended)
+                    .put("pos", position())
+                    .put("dur", length)
+                    .put("speed", speed.toDouble())
+                    .put("audioDelay", prefs.getLong("audioDelay", 0))
+                    .put("subDelay", prefs.getLong("subDelay", 0))
                     .put("aspect", ASPECTS[aspect].second)
                     .put("aspects", JSONArray(ASPECTS.map { it.second }))
                     .put("vol", audio.getStreamVolume(AudioManager.STREAM_MUSIC))
                     .put("volMax", audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC))
                     .put("subs", subsOn)
-                    .put("audioTracks", tracksJson(C.TRACK_TYPE_AUDIO))
-                    .put("subTracks", tracksJson(C.TRACK_TYPE_TEXT))
+                    .put("audioTracks", tracksJson(TRACK_AUDIO))
+                    .put("subTracks", tracksJson(TRACK_TEXT))
                     .put("players", JSONArray().apply {
                         cachedPlayers.forEach { put(JSONObject().put("pkg", it.first).put("name", it.second)) }
                     })
@@ -1263,14 +1476,15 @@ class PlayerActivity : AppCompatActivity(), CastController {
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val down = event.action == KeyEvent.ACTION_DOWN
+        val code = event.keyCode
         if (mode == "images") {
-            if (event.keyCode == KeyEvent.KEYCODE_MENU) {
+            if (code == KeyEvent.KEYCODE_MENU) {
                 if (down) showImageMenu()
                 return true
             }
             if (zoom > 1f) {
                 // Zoomed in: arrows move around the picture, Back returns to normal view.
-                val handled = when (event.keyCode) {
+                val handled = when (code) {
                     KeyEvent.KEYCODE_DPAD_LEFT -> { if (down) pan(1, 0); true }
                     KeyEvent.KEYCODE_DPAD_RIGHT -> { if (down) pan(-1, 0); true }
                     KeyEvent.KEYCODE_DPAD_UP -> { if (down) pan(0, 1); true }
@@ -1280,7 +1494,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
                 }
                 if (handled) return true
             }
-            val handled = when (event.keyCode) {
+            val handled = when (code) {
                 KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_MEDIA_REWIND, KeyEvent.KEYCODE_MEDIA_PREVIOUS -> {
                     if (down) { stopSlideshow(); showImage(index - 1) }; true
                 }
@@ -1289,8 +1503,8 @@ class PlayerActivity : AppCompatActivity(), CastController {
                 }
                 KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
                     if (down) {
-                        val p = player
-                        if (slideVideo && p != null) p.playWhenReady = !p.playWhenReady else toggleSlideshow()
+                        val p = mp
+                        if (slideVideo && p != null) { if (p.isPlaying) p.pause() else p.play() } else toggleSlideshow()
                     }
                     true
                 }
@@ -1299,33 +1513,75 @@ class PlayerActivity : AppCompatActivity(), CastController {
             return handled || super.dispatchKeyEvent(event)
         }
         if (mode == "video") {
-            if (event.keyCode == KeyEvent.KEYCODE_MENU) {
-                if (down) showMenu()
-                return true
-            }
-            if (event.keyCode == KeyEvent.KEYCODE_MEDIA_NEXT || event.keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS) {
-                if (down && event.repeatCount == 0) skip(if (event.keyCode == KeyEvent.KEYCODE_MEDIA_NEXT) 1 else -1)
-                return true
-            }
-            // ⏩ / ⏪ on the remote: our own seeking (adds up presses, speeds up when held).
-            if (event.keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD || event.keyCode == KeyEvent.KEYCODE_MEDIA_REWIND) {
-                if (down) {
-                    val step = seekStep(event.repeatCount)
-                    seekBy(if (event.keyCode == KeyEvent.KEYCODE_MEDIA_REWIND) -step else step)
-                }
-                return true
-            }
             val radio = current?.radio == true
-            // With the control bar hidden, left/right on the remote seek directly (other station for radio).
-            if (!playerView.isControllerFullyVisible &&
-                (event.keyCode == KeyEvent.KEYCODE_DPAD_LEFT || event.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT)
-            ) {
-                val left = event.keyCode == KeyEvent.KEYCODE_DPAD_LEFT
-                if (down && radio) { if (event.repeatCount == 0) skip(if (left) -1 else 1) }
-                else if (down) seekStep(event.repeatCount).let { seekBy(if (left) -it else it) }
+            when (code) {
+                KeyEvent.KEYCODE_MENU -> { if (down) showMenu(); return true }
+                KeyEvent.KEYCODE_MEDIA_NEXT, KeyEvent.KEYCODE_MEDIA_PREVIOUS -> {
+                    if (down && event.repeatCount == 0) skip(if (code == KeyEvent.KEYCODE_MEDIA_NEXT) 1 else -1)
+                    return true
+                }
+                KeyEvent.KEYCODE_MEDIA_FAST_FORWARD, KeyEvent.KEYCODE_MEDIA_REWIND -> {
+                    if (down) {
+                        val step = seekStep(event.repeatCount)
+                        seekBy(if (code == KeyEvent.KEYCODE_MEDIA_REWIND) -step else step)
+                        if (!radio && controls.visibility != View.VISIBLE) showControls(ctlSeek)
+                    }
+                    return true
+                }
+                KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                    if (down && event.repeatCount == 0) { togglePlay(); showControls() }
+                    return true
+                }
+                KeyEvent.KEYCODE_MEDIA_PLAY -> { if (down && mp?.isPlaying != true) togglePlay(); return true }
+                KeyEvent.KEYCODE_MEDIA_PAUSE -> { if (down) mp?.pause(); return true }
+            }
+            val visible = controls.visibility == View.VISIBLE
+            if (!visible) {
+                when (code) {
+                    KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                        if (down && event.repeatCount == 0) showControls(btnPlay)
+                        return true
+                    }
+                    KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                        val left = code == KeyEvent.KEYCODE_DPAD_LEFT
+                        if (down && radio) { if (event.repeatCount == 0) skip(if (left) -1 else 1) }
+                        else if (down) {
+                            seekStep(event.repeatCount).let { seekBy(if (left) -it else it) }
+                            showControls(ctlSeek)
+                        }
+                        return true
+                    }
+                    KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
+                        if (down) showControls()
+                        return true
+                    }
+                    KeyEvent.KEYCODE_BACK -> {
+                        // One Back mid-movie is easy to press by mistake: ask for a second press.
+                        if (!down && event.repeatCount == 0) {
+                            val now = System.currentTimeMillis()
+                            if (now - backAt < 2500 || ended || errorText.isNotEmpty()) finish()
+                            else { backAt = now; showCaption("Press Back again to close", 2500) }
+                        }
+                        return true
+                    }
+                }
+                return super.dispatchKeyEvent(event)
+            }
+            scheduleHide()
+            if (code == KeyEvent.KEYCODE_BACK) {
+                // Back first hides the bar; pressed again (bar hidden) it closes the player.
+                if (!down) controls.visibility = View.GONE
                 return true
             }
-            return playerView.dispatchKeyEvent(event) || super.dispatchKeyEvent(event)
+            if (ctlSeek.hasFocus() && (code == KeyEvent.KEYCODE_DPAD_LEFT || code == KeyEvent.KEYCODE_DPAD_RIGHT)) {
+                if (down) seekStep(event.repeatCount).let { seekBy(if (code == KeyEvent.KEYCODE_DPAD_LEFT) -it else it) }
+                return true
+            }
+            if (ctlSeek.hasFocus() && (code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER)) {
+                if (down && event.repeatCount == 0) togglePlay()
+                return true
+            }
+            return super.dispatchKeyEvent(event)
         }
         return super.dispatchKeyEvent(event)
     }
@@ -1351,9 +1607,9 @@ class PlayerActivity : AppCompatActivity(), CastController {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         reconnecting = false
-        sayBye()
+        if (!handedOff) sayBye()
         io.shutdownNow()
-        releasePlayer()
+        releaseVlc()
         // Built-in VPN is only for online playback; close it with the player unless another link is
         // starting, it was started from the phone's VPN button, or this screen only asked for permission.
         if (Bus.pending == null && !Vpn.keepOn && mode != "idle") Vpn.downAsync()
@@ -1365,28 +1621,31 @@ class PlayerActivity : AppCompatActivity(), CastController {
     }
 
     private fun fmt(ms: Long): String {
-        val s = ms / 1000
+        val s = ms.coerceAtLeast(0) / 1000
         return if (s >= 3600) "%d:%02d:%02d".format(s / 3600, (s % 3600) / 60, s % 60)
         else "%d:%02d".format(s / 60, s % 60)
     }
 
     companion object {
         private const val SLIDE_MS = 5000L
-        private const val SEEK_DELAY_MS = 450L
-        private val PASSTHROUGH_MIMES = setOf(
-            MimeTypes.AUDIO_AC3, MimeTypes.AUDIO_E_AC3, MimeTypes.AUDIO_E_AC3_JOC, MimeTypes.AUDIO_AC4,
-            MimeTypes.AUDIO_DTS, MimeTypes.AUDIO_DTS_HD, MimeTypes.AUDIO_DTS_EXPRESS, MimeTypes.AUDIO_TRUEHD,
-        )
         private const val REQ_VPN = 41
         private const val RECONNECT_GIVE_UP_S = 15 * 60
+        private const val SEEK_DELAY_MS = 450L
+        private const val STALL_MS = 15_000L
+        private const val CONTROLS_MS = 5000L
+        private const val TRACK_AUDIO = 1
+        private const val TRACK_TEXT = 3
         private val ZOOMS = listOf(1f, 1.25f, 1.5f, 2f, 2.5f, 3f)
-        private val SPEEDS = listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 1.75f, 2f)
+        private val SPEEDS = listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 1.75f, 2f, 2.5f, 3f)
+        private val DELAYS = listOf(-2000L, -1000L, -500L, -300L, -200L, -100L, -50L, 0L, 50L, 100L, 200L, 300L, 500L, 1000L, 2000L)
         private val ASPECTS = listOf(
-            AspectRatioFrameLayout.RESIZE_MODE_FIT to "Fit",
-            AspectRatioFrameLayout.RESIZE_MODE_ZOOM to "Zoom (fill, crop edges)",
-            AspectRatioFrameLayout.RESIZE_MODE_FILL to "Stretch",
-            AspectRatioFrameLayout.RESIZE_MODE_FIXED_WIDTH to "Fit width",
-            AspectRatioFrameLayout.RESIZE_MODE_FIXED_HEIGHT to "Fit height",
+            MediaPlayer.ScaleType.SURFACE_BEST_FIT to "Fit",
+            MediaPlayer.ScaleType.SURFACE_FIT_SCREEN to "Fill screen (crop edges)",
+            MediaPlayer.ScaleType.SURFACE_FILL to "Stretch",
+            MediaPlayer.ScaleType.SURFACE_16_9 to "16:9",
+            MediaPlayer.ScaleType.SURFACE_4_3 to "4:3",
+            MediaPlayer.ScaleType.SURFACE_221_1 to "Cinema 2.21:1",
+            MediaPlayer.ScaleType.SURFACE_ORIGINAL to "Original size",
         )
     }
 }

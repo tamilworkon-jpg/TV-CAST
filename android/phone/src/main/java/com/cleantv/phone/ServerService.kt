@@ -47,11 +47,22 @@ class ServerService : Service() {
         val openPi = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
+        // Battery-restricted apps are frozen while the phone is locked: say so, and let a tap fix it.
+        val restricted = !getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+        @android.annotation.SuppressLint("BatteryLife")
+        val fixPi = PendingIntent.getActivity(
+            this, 2,
+            Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, android.net.Uri.parse("package:$packageName")),
+            PendingIntent.FLAG_IMMUTABLE
+        )
         val notification = NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat)
             .setContentTitle("TV Cast is sharing with your TV")
-            .setContentText("Only while you're playing · stops by itself 2 min after the TV is done")
-            .setContentIntent(openPi)
+            .setContentText(
+                if (restricted) "⚠ Battery restricted: the TV may stop when this phone locks. Tap to allow."
+                else "Only while you're playing · stops by itself 2 min after the TV is done"
+            )
+            .setContentIntent(if (restricted) fixPi else openPi)
             .addAction(0, "Disconnect", stopPi)
             .setOngoing(true)
             .build()
@@ -65,9 +76,10 @@ class ServerService : Service() {
         } catch (e: Exception) {
             Log.e("TvCast", "server start failed", e)
         }
+        // Keeps Wi-Fi from dozing while the screen is off (high-performance mode where the phone still honours it).
         @Suppress("DEPRECATION")
         wifiLock = (applicationContext.getSystemService(WIFI_SERVICE) as WifiManager)
-            .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "tvcast").apply { acquire() }
+            .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "tvcast").apply { setReferenceCounted(false); acquire() }
         wakeLock = getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "tvcast:server").apply { acquire() }
         running = true

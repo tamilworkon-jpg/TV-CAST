@@ -47,16 +47,21 @@ class MediaServer(private val ctx: Context, private val token: String, private v
 
     private fun notFound() = newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "not found")
 
-    /** Small JPEG preview for the TV browser, from MediaStore's own thumbnail cache. */
+    /** Small JPEG preview for the TV browser. */
     private fun serveThumb(kind: String?, id: Long?): Response {
         if (id == null) return notFound()
-        val uri = if (kind == "v") MediaRepo.videoUri(id) else MediaRepo.imageUri(id)
-        val bmp = ctx.contentResolver.loadThumbnail(uri, Size(400, 400), null)
+        val bytes = if (kind == "v") Thumbs.videoJpeg(ctx, id) else {
+            val bmp = ctx.contentResolver.loadThumbnail(MediaRepo.imageUri(id), Size(400, 400), null)
+            jpeg(bmp)
+        }
+        return newFixedLengthResponse(Response.Status.OK, "image/jpeg", ByteArrayInputStream(bytes), bytes.size.toLong())
+    }
+
+    private fun jpeg(bmp: Bitmap): ByteArray {
         val out = ByteArrayOutputStream()
         bmp.compress(Bitmap.CompressFormat.JPEG, 80, out)
         bmp.recycle()
-        val bytes = out.toByteArray()
-        return newFixedLengthResponse(Response.Status.OK, "image/jpeg", ByteArrayInputStream(bytes), bytes.size.toLong())
+        return out.toByteArray()
     }
 
     private fun serveUri(session: IHTTPSession, uri: Uri): Response {

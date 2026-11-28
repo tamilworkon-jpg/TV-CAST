@@ -33,7 +33,10 @@ class App : Application(), ImageLoaderFactory {
 class ThumbFetcher(private val data: Media, private val options: Options) : Fetcher {
     override suspend fun fetch(): FetchResult {
         val ctx = options.context
-        val bmp = ctx.contentResolver.loadThumbnail(data.uri, Size(384, 384), null)
+        val bmp = if (data.isVideo) {
+            val jpg = Thumbs.videoJpeg(ctx, data.id)
+            android.graphics.BitmapFactory.decodeByteArray(jpg, 0, jpg.size)
+        } else ctx.contentResolver.loadThumbnail(data.uri, Size(384, 384), null)
         return DrawableResult(BitmapDrawable(ctx.resources, bmp), true, DataSource.DISK)
     }
 

@@ -313,6 +313,8 @@ object Prefs {
     fun token(ctx: Context): String = sp(ctx).getString("token", null) ?: java.util.UUID.randomUUID().toString()
         .replace("-", "").also { sp(ctx).edit().putString("token", it).apply() }
 
+    fun historyJson(ctx: Context): String = sp(ctx).getString("history", "[]") ?: "[]"
+
     fun saveHistory(ctx: Context, json: String) = sp(ctx).edit().putString("history", json).apply()
 
     /** Updates one entry of the cached TV history (moves it to the front), e.g. from the remote's live status. */
