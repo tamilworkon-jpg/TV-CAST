@@ -69,6 +69,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var countLabel: TextView
     private var firstLoad = true
     private var offline = false
+    private var offlineTicks = 0
     private var stations = emptyList<Item>()
     /** Search text the station list was loaded for (null = not loaded yet / failed). */
     private var stationsFor: String? = null
@@ -237,6 +238,8 @@ class MainActivity : AppCompatActivity() {
     private val pinPoll: Runnable = object : Runnable {
         override fun run() {
             PairDialog.showIfPending(this@MainActivity)
+            // Phone offline: look again every 10 s, so the list appears as soon as the phone app is opened.
+            if (offline && base != null && ++offlineTicks % 10 == 0) load()
             grid.postDelayed(this, 1000)
         }
     }
@@ -340,7 +343,7 @@ class MainActivity : AppCompatActivity() {
                     offline = true
                     updateInfo()
                     if (videos.isEmpty() && images.isEmpty() && !radio) {
-                        showEmpty("$phoneName isn't sharing right now.\nOpen TV Cast on the phone (same Wi-Fi), then press Refresh.")
+                        showEmpty("$phoneName isn't sharing right now.\nOpen TV Cast on the phone (same Wi-Fi) — the videos appear here by themselves.")
                         return@runOnUiThread
                     }
                 } else {

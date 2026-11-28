@@ -66,7 +66,12 @@ object RadioDirectory {
         val a = JSONArray(text)
         return (0 until a.length()).mapNotNull { i ->
             val o = a.getJSONObject(i)
-            val u = o.optString("url_resolved").ifBlank { o.optString("url") }
+            // url_resolved can hold a signed token that has long expired (zeno.fm "zt=…" links);
+            // the station's own address redirects to a fresh one, so prefer it then.
+            val resolved = o.optString("url_resolved")
+            val original = o.optString("url")
+            val stale = Regex("[?&](zt|token|exp|expires|signature)=", RegexOption.IGNORE_CASE).containsMatchIn(resolved)
+            val u = if ((stale || resolved.isBlank()) && original.startsWith("http")) original else resolved.ifBlank { original }
             if (!u.startsWith("http")) return@mapNotNull null
             val tags = o.optString("tags").split(',').map { it.trim() }.filter { it.isNotEmpty() }.take(3).joinToString(" · ")
             val kbps = o.optInt("bitrate").takeIf { it > 0 }?.let { "$it kbps" }

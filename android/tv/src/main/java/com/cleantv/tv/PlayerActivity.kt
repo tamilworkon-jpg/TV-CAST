@@ -39,6 +39,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
     private lateinit var image: ImageView
     private lateinit var caption: TextView
     private lateinit var spinner: ProgressBar
+    private lateinit var radioInfo: TextView
     private lateinit var controls: View
     private lateinit var ctlTitle: TextView
     private lateinit var ctlInfo: TextView
@@ -107,6 +108,8 @@ class PlayerActivity : AppCompatActivity(), CastController {
     private var lastStallFix = 0L
     private var stallTime = -1L
     private var backAt = 0L
+    /** We are stopping/replacing the media ourselves; ignore the resulting Stopped event. */
+    private var stopping = false
     /** The video was handed to another player app: don't tell the phone to stop sharing. */
     private var handedOff = false
     private val io = java.util.concurrent.Executors.newSingleThreadExecutor()
@@ -160,6 +163,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
         image = findViewById(R.id.image)
         caption = findViewById(R.id.caption)
         spinner = findViewById(R.id.spinner)
+        radioInfo = findViewById(R.id.radioInfo)
         controls = findViewById(R.id.controls)
         ctlTitle = findViewById(R.id.ctlTitle)
         ctlInfo = findViewById(R.id.ctlInfo)
@@ -327,6 +331,8 @@ class PlayerActivity : AppCompatActivity(), CastController {
 
     private fun onVlcEvent(e: MediaPlayer.Event) {
         if (mp == null || isFinishing) return
+        if (e.type != MediaPlayer.Event.TimeChanged && e.type != MediaPlayer.Event.PositionChanged &&
+            e.type != MediaPlayer.Event.Buffering) android.util.Log.i("TvCast", "vlc event 0x${Integer.toHexString(e.type)} mode=$mode")
         when (e.type) {
             MediaPlayer.Event.Playing -> {
                 buffering = false
@@ -346,6 +352,8 @@ class PlayerActivity : AppCompatActivity(), CastController {
             MediaPlayer.Event.LengthChanged -> length = e.lengthChanged
             MediaPlayer.Event.EndReached -> onEnded()
             MediaPlayer.Event.EncounteredError -> onError()
+            // Stopped without us asking (stream could not be opened): treat like an error.
+            MediaPlayer.Event.Stopped -> if (!stopping && mode == "video" && !ended && !started) onError()
             MediaPlayer.Event.ESAdded, MediaPlayer.Event.ESSelected -> {
                 val p = mp ?: return
                 if (!subsOn && p.spuTrack != -1) p.setSpuTrack(-1)
@@ -396,7 +404,11 @@ class PlayerActivity : AppCompatActivity(), CastController {
     }
 
     /** Starts queue entry [i] at [startMs]. */
-    private fun startItem(i: Int, startMs: Long) {
+    /** Radio only: true = this attempt uses VLC's own demuxer (second try after FFmpeg's stayed silent). */
+    private var radioAlt = false
+
+    private fun startItem(i: Int, startMs: Long, alt: Boolean = false) {
+        radioAlt = alt
         if (queue.isEmpty()) return
         val p = vlc()
         ensureSurface()
@@ -417,10 +429,26 @@ class PlayerActivity : AppCompatActivity(), CastController {
         m.addOption(":http-user-agent=Mozilla/5.0 (Linux; Android 9; AFT) TVCast/2")
         if (v.online) m.addOption(":network-caching=3000")
         if (startMs > 0) m.addOption(":start-time=${startMs / 1000.0}")
+        // Many stations label MP3 as ".aac" (or vice versa); VLC trusts the extension and plays silence.
+        // FFmpeg's demuxer looks at the actual data. Playlists/HLS still go through VLC's own handling.
+        if (v.radio && !alt && !Regex("\\.(m3u8?|pls|asx|xspf)(\\?|$)", RegexOption.IGNORE_CASE).containsMatchIn(v.url))
+            m.addOption(":demux=avformat")
+        stopping = true
         p.media = m
         m.release()
+        stopping = false
         p.play()
+        handler.removeCallbacks(startTimeout)
+        handler.postDelayed(startTimeout, if (v.online) 25_000 else 40_000)
         if (controls.visibility == View.VISIBLE) updateControls()
+    }
+
+    /** Nothing played within the time limit (dead station, unreachable link): handle it as an error. */
+    private val startTimeout = Runnable {
+        if (mode == "video" && !started && !ended && errorText.isEmpty() && !reconnecting) {
+            android.util.Log.i("TvCast", "start timeout")
+            onError()
+        }
     }
 
     /** Current queue entry. */
@@ -440,8 +468,11 @@ class PlayerActivity : AppCompatActivity(), CastController {
     private fun radioView(c: VideoItem) {
         if (!c.radio) {
             if (mode == "video") image.visibility = View.GONE
+            radioInfo.visibility = View.GONE
             return
         }
+        radioInfo.visibility = View.VISIBLE
+        radioInfo.text = c.title + (if (queue.size > 1) "\n◀ ▶  other stations  (${qIndex + 1} of ${queue.size})" else "")
         image.visibility = View.VISIBLE
         image.scaleType = ImageView.ScaleType.CENTER_INSIDE
         if (c.artwork != null) image.load(c.artwork, imageLoader(this)) { error(R.drawable.ic_launcher) }
@@ -643,6 +674,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
         val wantsToPlay = p != null && (p.isPlaying || buffering)
         val moving = t != stallTime
         stallTime = t
+        if (mode == "video" && c?.radio == true) { checkRadioSilent(wantsToPlay && !moving && started && errorText.isEmpty(), now); return }
         val stalled = mode == "video" && wantsToPlay && !moving && c != null && !c.online && !c.radio &&
             !reconnecting && !ended && errorText.isEmpty() && started && seekTarget < 0
         if (!stalled) { stallSince = 0L; return }
@@ -665,6 +697,16 @@ class PlayerActivity : AppCompatActivity(), CastController {
                 else startReconnect()
             }
         }
+    }
+
+    /** A station that "plays" but whose clock doesn't move is silent: retry with the other demuxer, then skip. */
+    private fun checkRadioSilent(silent: Boolean, now: Long) {
+        if (!silent) { stallSince = 0L; return }
+        if (stallSince == 0L) { stallSince = now; return }
+        if (now - stallSince < STALL_MS) return
+        stallSince = 0L
+        android.util.Log.i("TvCast", "radio silent, alt=$radioAlt")
+        if (!radioAlt) startItem(qIndex, 0, alt = true) else onError()
     }
 
     /** Best known position of the current item. */
@@ -1175,6 +1217,7 @@ class PlayerActivity : AppCompatActivity(), CastController {
         queue = mutableListOf()
         controls.visibility = View.GONE
         spinner.visibility = View.GONE
+        radioInfo.visibility = View.GONE
         urls = r.urls
         names = r.names
         albumVideos = r.albumVideos

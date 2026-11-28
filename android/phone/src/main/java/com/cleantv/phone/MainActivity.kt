@@ -216,6 +216,12 @@ class MainActivity : AppCompatActivity() {
     private fun refreshHistory() {
         if (Prefs.lastTv(this)?.paired != true) return
         lifecycleScope.launch {
+            // Phone app open = its videos can be browsed from the TV remote too: share while open
+            // (stops by itself 2 min after the app is closed and the TV isn't playing anything).
+            if (!ServerService.running && withContext(Dispatchers.IO) { Net.localIp() } != null) {
+                ServerService.start(this@MainActivity)
+                repeat(20) { if (!ServerService.running) delay(100) }
+            }
             val tv = TvClient.ensure(this@MainActivity, announce = ServerService.running)
             updateTvLabel(connected = tv != null)
             if (tv == null || !tv.paired) return@launch
